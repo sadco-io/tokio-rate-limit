@@ -1,0 +1,83 @@
+[package]
+name = "tokio-rate-limit"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75.0"
+authors = ["Daniel Curtis <drc@danielryancurtis.com>"]
+description = "High-performance, lock-free rate limiting library with pluggable algorithms and Axum middleware"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/danielrcurtis/tokio-rate-limit"
+documentation = "https://docs.rs/tokio-rate-limit"
+keywords = ["rate-limit", "rate-limiting", "token-bucket", "axum", "middleware"]
+categories = ["web-programming", "asynchronous", "network-programming"]
+readme = "README.md"
+
+[features]
+default = []
+middleware = ["axum", "tower"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["sync", "time"] }
+
+# Concurrency primitives
+parking_lot = "0.12"
+dashmap = "6.1"
+
+# Optional: Axum middleware
+axum = { version = "0.7", optional = true }
+tower = { version = "0.5", optional = true }
+
+# Error handling
+thiserror = "2.0"
+
+# Utilities
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.40", features = ["full", "test-util"] }
+criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
+axum = "0.7"
+tower = "0.5"
+hyper = "1.5"
+http-body-util = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# For comparison benchmarks
+governor = "0.7"
+redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
+
+[[bench]]
+name = "rate_limit_performance"
+harness = false
+
+[[bench]]
+name = "comparison"
+harness = false
+
+[[bench]]
+name = "shard_tuning"
+harness = false
+
+[[bench]]
+name = "key_cardinality"
+harness = false
+
+[[bench]]
+name = "redis_comparison"
+harness = false
+
+[[bench]]
+name = "false_sharing_test"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.bench]
+lto = true
+codegen-units = 1
+opt-level = 3
