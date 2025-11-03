@@ -52,10 +52,17 @@ impl AtomicTokenState {
         }
     }
 
-    /// Attempts to consume one token from the bucket.
+    /// Attempts to consume tokens from the bucket.
     ///
     /// This method performs automatic refilling based on elapsed time and uses
     /// lock-free compare-and-swap loops for token updates.
+    ///
+    /// # Arguments
+    ///
+    /// * `capacity` - Maximum bucket capacity
+    /// * `refill_rate_per_second` - Refill rate per second
+    /// * `now_nanos` - Current time in nanoseconds
+    /// * `cost` - Number of tokens to consume
     ///
     /// Returns `(permitted, remaining_tokens)`
     fn try_consume(
@@ -63,12 +70,14 @@ impl AtomicTokenState {
         capacity: u64,
         refill_rate_per_second: u64,
         now_nanos: u64,
+        cost: u64,
     ) -> (bool, u64) {
         // Update last access time (for TTL tracking)
         self.last_access_nanos.store(now_nanos, Ordering::Relaxed);
 
-        // Scale capacity for precision (using saturating to prevent overflow)
+        // Scale capacity and cost for precision (using saturating to prevent overflow)
         let scaled_capacity = capacity.saturating_mul(SCALE);
+        let token_cost = cost.saturating_mul(SCALE);
 
         loop {
             // Load current state
@@ -89,12 +98,11 @@ impl AtomicTokenState {
                 .saturating_add(new_tokens_to_add)
                 .min(scaled_capacity);
 
-            // Try to consume one token (SCALE units)
-            let token_cost = SCALE;
+            // Try to consume the requested cost
 
             if updated_tokens >= token_cost {
                 // We have enough tokens, try to consume
-                let new_tokens = updated_tokens - token_cost;
+                let new_tokens = updated_tokens.saturating_sub(token_cost);
                 let new_time = if new_tokens_to_add > 0 {
                     now_nanos
                 } else {
@@ -437,9 +445,9 @@ impl Algorithm for TokenBucket {
             }
         };
 
-        // Try to consume a token
+        // Try to consume a token (cost of 1)
         let (permitted, remaining) =
-            state.try_consume(self.capacity, self.refill_rate_per_second, now);
+            state.try_consume(self.capacity, self.refill_rate_per_second, now, 1);
 
         // Calculate retry_after if rate limited
         let retry_after = if !permitted {
@@ -456,11 +464,94 @@ impl Algorithm for TokenBucket {
             None
         };
 
+        // Calculate reset time (time until bucket is full)
+        // If we have N tokens and capacity is M, time to refill is:
+        // (M - N) / refill_rate_per_second
+        let reset = if self.refill_rate_per_second > 0 && remaining < self.capacity {
+            let tokens_to_refill = self.capacity.saturating_sub(remaining);
+            let seconds_to_full = tokens_to_refill as f64 / self.refill_rate_per_second as f64;
+            Some(Duration::from_secs_f64(seconds_to_full.max(0.001))) // Minimum 1ms
+        } else if remaining >= self.capacity {
+            // Bucket is already full
+            Some(Duration::from_secs(0))
+        } else {
+            // Refill rate is 0, bucket will never refill
+            None
+        };
+
         Ok(RateLimitDecision {
             permitted,
             retry_after,
             remaining: Some(remaining),
             limit: self.capacity,
+            reset,
+        })
+    }
+
+    async fn check_with_cost(&self, key: &str, cost: u64) -> Result<RateLimitDecision> {
+        let now = self.now_nanos();
+
+        // Cleanup idle keys if TTL is configured (simple probabilistic cleanup)
+        // Only run cleanup 1% of the time to avoid overhead
+        if self.idle_ttl.is_some() && (now % 100) == 0 {
+            self.cleanup_idle(now);
+        }
+
+        // Get or create token state for this key
+        let guard = self.tokens.guard();
+        let key_string = key.to_string();
+        let state = match self.tokens.get(&key_string, &guard) {
+            Some(state) => state.clone(),
+            None => {
+                // Insert new state and return it
+                let new_state = Arc::new(AtomicTokenState::new(self.capacity, now));
+                match self
+                    .tokens
+                    .try_insert(key_string.clone(), new_state.clone(), &guard)
+                {
+                    Ok(_) => new_state,
+                    Err(current) => current.current.clone(), // Another thread inserted, use their value
+                }
+            }
+        };
+
+        // Try to consume tokens with the specified cost
+        let (permitted, remaining) =
+            state.try_consume(self.capacity, self.refill_rate_per_second, now, cost);
+
+        // Calculate retry_after if rate limited
+        let retry_after = if !permitted {
+            // Calculate how long until we'll have enough tokens available
+            let tokens_needed = cost.saturating_sub(remaining);
+            let seconds_to_wait = if self.refill_rate_per_second > 0 {
+                (tokens_needed as f64 / self.refill_rate_per_second as f64).ceil()
+            } else {
+                1.0
+            };
+            Some(Duration::from_secs_f64(seconds_to_wait.max(0.001))) // Minimum 1ms
+        } else {
+            None
+        };
+
+        // Calculate reset time (time until bucket is full)
+        let reset = if self.refill_rate_per_second > 0 && remaining < self.capacity {
+            let tokens_to_refill = self.capacity.saturating_sub(remaining);
+            let seconds_to_full = tokens_to_refill as f64 / self.refill_rate_per_second as f64;
+            Some(Duration::from_secs_f64(seconds_to_full.max(0.001))) // Minimum 1ms
+        } else if remaining >= self.capacity {
+            // Bucket is already full
+            Some(Duration::from_secs(0))
+        } else {
+            // Refill rate is 0, bucket will never refill
+            None
+        };
+
+        Ok(RateLimitDecision {
+            permitted,
+            retry_after,
+            remaining: Some(remaining),
+            limit: self.capacity,
+            reset,
         })
     }
 }

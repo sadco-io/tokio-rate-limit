@@ -225,11 +225,27 @@ where
 
             if decision.permitted {
                 // Request is allowed, add rate limit headers and pass through
+                #[cfg(feature = "metrics-support")]
+                {
+                    metrics::counter!("tokio_rate_limit.requests.allowed").increment(1);
+                    if let Some(remaining) = decision.remaining {
+                        metrics::histogram!("tokio_rate_limit.remaining_tokens").record(remaining as f64);
+                    }
+                }
+
                 let mut response = inner.call(req).await?;
                 add_rate_limit_headers(&mut response, &decision);
                 Ok(response)
             } else {
                 // Request is rate limited
+                #[cfg(feature = "metrics-support")]
+                {
+                    metrics::counter!("tokio_rate_limit.requests.denied").increment(1);
+                    if let Some(remaining) = decision.remaining {
+                        metrics::histogram!("tokio_rate_limit.remaining_tokens").record(remaining as f64);
+                    }
+                }
+
                 Ok(rate_limit_response(&decision))
             }
         })
@@ -237,16 +253,48 @@ where
 }
 
 /// Adds rate limit headers to a response.
+///
+/// This function adds both IETF standard headers and legacy X-RateLimit-* headers
+/// for backward compatibility:
+///
+/// IETF Standard Headers (draft-ietf-httpapi-ratelimit-headers):
+/// - RateLimit-Limit: Maximum requests allowed
+/// - RateLimit-Remaining: Requests remaining in current window
+/// - RateLimit-Reset: Seconds until bucket is full
+///
+/// Legacy Headers (backward compatibility):
+/// - X-RateLimit-Limit: Maximum requests allowed
+/// - X-RateLimit-Remaining: Requests remaining in current window
 fn add_rate_limit_headers(response: &mut Response<Body>, decision: &RateLimitDecision) {
     let headers = response.headers_mut();
 
-    // Add X-RateLimit-Limit header
+    // IETF Standard Headers
+    headers.insert(
+        "RateLimit-Limit",
+        decision.limit.to_string().parse().unwrap(),
+    );
+
+    if let Some(remaining) = decision.remaining {
+        headers.insert(
+            "RateLimit-Remaining",
+            remaining.to_string().parse().unwrap(),
+        );
+    }
+
+    if let Some(reset) = decision.reset {
+        let reset_seconds = reset.as_secs();
+        headers.insert(
+            "RateLimit-Reset",
+            reset_seconds.to_string().parse().unwrap(),
+        );
+    }
+
+    // Legacy X-RateLimit-* headers for backward compatibility
     headers.insert(
         "X-RateLimit-Limit",
         decision.limit.to_string().parse().unwrap(),
     );
 
-    // Add X-RateLimit-Remaining header
     if let Some(remaining) = decision.remaining {
         headers.insert(
             "X-RateLimit-Remaining",
@@ -256,18 +304,50 @@ fn add_rate_limit_headers(response: &mut Response<Body>, decision: &RateLimitDec
 }
 
 /// Creates a 429 Too Many Requests response with rate limit headers.
+///
+/// This function adds both IETF standard headers and legacy headers:
+///
+/// IETF Standard Headers:
+/// - RateLimit-Limit: Maximum requests allowed
+/// - RateLimit-Remaining: Requests remaining (typically 0)
+/// - RateLimit-Reset: Seconds until bucket is full
+///
+/// Legacy Headers:
+/// - X-RateLimit-Limit: Maximum requests allowed
+/// - X-RateLimit-Remaining: Requests remaining (typically 0)
+/// - Retry-After: Seconds to wait before retrying
 fn rate_limit_response(decision: &RateLimitDecision) -> Response<Body> {
     let mut response = (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
 
     let headers = response.headers_mut();
 
-    // Add X-RateLimit-Limit header
+    // IETF Standard Headers
+    headers.insert(
+        "RateLimit-Limit",
+        decision.limit.to_string().parse().unwrap(),
+    );
+
+    if let Some(remaining) = decision.remaining {
+        headers.insert(
+            "RateLimit-Remaining",
+            remaining.to_string().parse().unwrap(),
+        );
+    }
+
+    if let Some(reset) = decision.reset {
+        let reset_seconds = reset.as_secs();
+        headers.insert(
+            "RateLimit-Reset",
+            reset_seconds.to_string().parse().unwrap(),
+        );
+    }
+
+    // Legacy X-RateLimit-* headers for backward compatibility
     headers.insert(
         "X-RateLimit-Limit",
         decision.limit.to_string().parse().unwrap(),
     );
 
-    // Add X-RateLimit-Remaining header (should be 0)
     if let Some(remaining) = decision.remaining {
         headers.insert(
             "X-RateLimit-Remaining",
@@ -275,7 +355,7 @@ fn rate_limit_response(decision: &RateLimitDecision) -> Response<Body> {
         );
     }
 
-    // Add Retry-After header
+    // Add Retry-After header (legacy, but still widely used)
     if let Some(retry_after) = decision.retry_after {
         let seconds = retry_after.as_secs();
         headers.insert("Retry-After", seconds.to_string().parse().unwrap());

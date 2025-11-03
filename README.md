@@ -7,12 +7,49 @@ High-performance rate limiting library for Rust with lock-free token accounting,
 [![License](https://img.shields.io/crates/l/tokio-rate-limit)](LICENSE-MIT)
 [![Build Status](https://img.shields.io/github/workflow/status/danielrcurtis/tokio-rate-limit/CI)](https://github.com/danielrcurtis/tokio-rate-limit/actions)
 
+**Performance:** 15.2M ops/sec single-threaded | 8.0M ops/sec on 4 cores | Sub-microsecond P99 latency
+
+## Why Another Rate Limiter?
+
+Most Rust rate limiting libraries (like `governor`) are optimized for **global rate limiting** - applying a single limit across all requests. This works great for simple "API allows 1000 requests/sec total" scenarios.
+
+But what if you need **per-client rate limits**? Different limits for each user, IP address, or API key?
+
+That's where `tokio-rate-limit` shines:
+
+- ✅ **Built-in per-key tracking** - Independent buckets for each client/user/IP
+- ✅ **Drop-in Axum middleware** - Zero boilerplate, automatic 429 responses with RFC-compliant headers
+- ✅ **Cost-based limiting** - Different costs for different operations (NEW in v0.2.0)
+- ✅ **Production observability** - Optional tracing & metrics with zero overhead when disabled (NEW in v0.2.0)
+- ✅ **15M+ ops/sec performance** - Lock-free design scales to thousands of keys
+- ✅ **Memory safe** - TTL-based eviction prevents unbounded growth
+
+**Use Cases:**
+- Rate limiting per user account in a multi-tenant SaaS
+- Per-IP rate limiting for public APIs
+- Per-API-key rate limiting for developer platforms
+- Weighted rate limiting (heavy operations consume more tokens)
+- Any scenario where you need independent limits for different entities
+
+## Design Goals
+
+1. **Per-Key Performance**: Optimize for thousands of independent rate limit keys, not just a single global limit
+2. **Lock-Free**: Zero locks in the hot path - atomic operations only
+3. **Production Ready**: Comprehensive testing, observability, standards compliance (IETF headers)
+4. **Ergonomic**: Drop-in Axum middleware with sensible defaults
+5. **Flexible**: Custom key extraction, cost-based limiting, pluggable algorithms
+6. **Safe**: Memory-safe with TTL eviction, overflow protection, deterministic testing
+
 ## Features
 
-- **Blazing Fast**: 17M+ operations/second with lock-free token accounting and lock-free concurrent hashmap
+- **Blazing Fast**: 15M+ operations/second with lock-free token accounting and lock-free concurrent hashmap
 - **Per-Key Rate Limiting**: Independent limits per client/IP/user/API key
 - **Memory Safe**: Optional TTL-based eviction for high-cardinality keys
 - **Overflow Protected**: Saturating arithmetic with explicit bounds prevents panics
+- **Standards Compliant**: IETF RateLimit headers (`RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`) *(NEW in v0.2.0)*
+- **Cost-Based Limiting**: Different token costs for different operations *(NEW in v0.2.0)*
+- **Blocking Acquire**: Wait for tokens with `acquire()` and `acquire_timeout()` *(NEW in v0.2.0)*
+- **Observability**: Optional tracing and metrics with zero overhead when disabled *(NEW in v0.2.0)*
 - **Pluggable Algorithms**: Token bucket included, extensible for custom algorithms
 - **Axum Middleware**: Drop-in middleware for Axum web applications with proper headers
 - **Custom Key Extraction**: Rate limit by IP, user ID, API key, or any custom logic
@@ -26,13 +63,66 @@ Benchmarks on an Apple M1 Pro (darwin) using flurry's lock-free HashMap:
 
 | Configuration | Latency (P50) | Throughput | vs DashMap |
 |--------------|---------------|------------|------------|
-| Single-threaded | 56ns | 17.7M ops/sec | +19% |
-| 2 threads | 64ns | 15.5M ops/sec | +66% |
-| 4 threads | 74ns | 13.5M ops/sec | +69% |
-| 8 threads | 141ns | 7.1M ops/sec | +117% |
-| 16 threads | 406ns | 2.5M ops/sec | +40% |
+| Single-threaded | 65ns | 15.2M ops/sec | +19% |
+| 2 threads | 117ns | 8.6M ops/sec | +66% |
+| 4 threads | 125ns | 8.0M ops/sec | +69% |
+| 8 threads | 221ns | 4.5M ops/sec | +117% |
+| 16 threads | 384ns | 2.6M ops/sec | +40% |
 
-**Key Insight**: Our library excels at per-key rate limiting (separate limits per client), while libraries like `governor` are optimized for global rate limiting (single limit for all requests). Both have their use cases, and this library fills the per-key niche with excellent performance.
+**Observability Overhead (Optional Features):**
+- Baseline (no features): 15.2M ops/sec
+- With tracing: 12.8M ops/sec (-16%, but <0.001% in real HTTP workloads)
+- With metrics: 12.9M ops/sec (-15%, negligible in production)
+
+See [ENHANCED_API_BENCHMARKS.md](ENHANCED_API_BENCHMARKS.md) for detailed performance analysis.
+
+**Key Insight**: Our library excels at **per-key rate limiting** (separate limits per client), while libraries like `governor` are optimized for **global rate limiting** (single limit for all requests). Both have their use cases, and this library fills the per-key niche with excellent performance.
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     tokio-rate-limit                         │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │                 RateLimiter API                       │  │
+│  │  check() | check_with_cost() | acquire()             │  │
+│  └────────────────────┬──────────────────────────────────┘  │
+│                       │                                      │
+│  ┌────────────────────▼──────────────────────────────────┐  │
+│  │              Algorithm Trait                          │  │
+│  │         (Pluggable, Token Bucket default)             │  │
+│  └────────────────────┬──────────────────────────────────┘  │
+│                       │                                      │
+│  ┌────────────────────▼──────────────────────────────────┐  │
+│  │         flurry::HashMap<Key, TokenBucket>             │  │
+│  │         (Lock-free concurrent hashmap)                │  │
+│  │                                                        │  │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐            │  │
+│  │  │ Bucket   │  │ Bucket   │  │ Bucket   │   ...      │  │
+│  │  │ "ip1"    │  │ "user2"  │  │ "key3"   │            │  │
+│  │  │ tokens:  │  │ tokens:  │  │ tokens:  │            │  │
+│  │  │ AtomicU64│  │ AtomicU64│  │ AtomicU64│            │  │
+│  │  └──────────┘  └──────────┘  └──────────┘            │  │
+│  │                                                        │  │
+│  │         Each bucket: atomic CAS operations            │  │
+│  │         Zero locks, zero contention                   │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                               │
+│  Optional: TTL-based eviction (1% probabilistic cleanup)     │
+│  Optional: Tracing spans & metrics                           │
+└───────────────────────────────────────────────────────────────┘
+```
+
+**Request Flow (Sub-microsecond):**
+1. Extract key (e.g., IP address) from request - ~5ns
+2. Hash lookup in flurry HashMap (lock-free) - ~20ns
+3. Atomic CAS to consume token - ~10ns
+4. Calculate remaining tokens & reset time - ~5ns
+5. Return decision with IETF headers - ~5ns
+
+**Total: ~45-65ns** for in-memory permission check.
 
 ## Quick Start
 
@@ -40,10 +130,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tokio-rate-limit = "0.1"
+tokio-rate-limit = "0.2"
 
 # For Axum middleware support
-tokio-rate-limit = { version = "0.1", features = ["middleware"] }
+tokio-rate-limit = { version = "0.2", features = ["middleware"] }
+
+# For observability (tracing + metrics)
+tokio-rate-limit = { version = "0.2", features = ["middleware", "observability"] }
+tokio-rate-limit = { version = "0.2", features = ["middleware", "metrics-support"] }
 ```
 
 ### Basic Usage
@@ -66,11 +160,54 @@ async fn main() {
     if decision.permitted {
         // Process request
         println!("Request allowed! Remaining: {}", decision.remaining.unwrap());
+        println!("Reset in: {:?}", decision.reset.unwrap());
     } else {
         // Rate limit exceeded
         println!("Rate limited! Retry after: {:?}", decision.retry_after.unwrap());
     }
 }
+```
+
+### Cost-Based Rate Limiting *(NEW in v0.2.0)*
+
+Assign different costs to different operations:
+
+```rust
+let limiter = RateLimiter::builder()
+    .requests_per_second(100)
+    .burst(200)
+    .build()
+    .unwrap();
+
+// Light operation - costs 1 token
+limiter.check_with_cost("user-123", 1).await?;
+
+// Heavy operation - costs 50 tokens
+limiter.check_with_cost("user-123", 50).await?;
+
+// Use cases:
+// - Simple queries: cost=1, Complex queries: cost=10
+// - Small uploads: cost=1, Large uploads: cost=100
+// - Fast API calls: cost=1, Expensive AI inference: cost=50
+```
+
+### Blocking Acquire *(NEW in v0.2.0)*
+
+Wait for tokens to become available:
+
+```rust
+// Block indefinitely until tokens available
+let decision = limiter.acquire("user-123").await?;
+
+// Block with timeout
+use std::time::Duration;
+let decision = limiter.acquire_timeout("user-123", Duration::from_secs(5)).await?;
+if !decision.permitted {
+    println!("Timed out waiting for tokens");
+}
+
+// Non-blocking (original behavior)
+let decision = limiter.try_acquire("user-123").await?;
 ```
 
 ### Axum Middleware
@@ -112,6 +249,28 @@ async fn handler() -> &'static str {
 }
 ```
 
+**Response Headers (IETF RFC Standards):**
+
+When rate limit is applied, responses include:
+
+```http
+RateLimit-Limit: 100
+RateLimit-Remaining: 42
+RateLimit-Reset: 3
+X-RateLimit-Limit: 100          # Legacy header (backward compat)
+X-RateLimit-Remaining: 42       # Legacy header (backward compat)
+```
+
+When rate limit is exceeded (HTTP 429):
+
+```http
+HTTP/1.1 429 Too Many Requests
+RateLimit-Limit: 100
+RateLimit-Remaining: 0
+RateLimit-Reset: 8
+Retry-After: 8
+```
+
 ### Custom Key Extraction
 
 Rate limit by user ID, API key, or any custom logic:
@@ -142,6 +301,98 @@ let app: Router = Router::new()
     ));
 ```
 
+## Memory Safety and TTL Eviction
+
+By default, token buckets are created on-demand and persist indefinitely. For high-cardinality keys (e.g., per-IP limits with millions of IPs), use TTL-based eviction:
+
+```rust
+use std::time::Duration;
+use tokio_rate_limit::algorithm::TokenBucket;
+
+// Evict idle buckets after 1 hour
+let algorithm = TokenBucket::with_ttl(
+    200,                          // capacity
+    100,                          // refill rate per second
+    Duration::from_secs(3600)     // TTL
+);
+
+let limiter = RateLimiter::from_algorithm(algorithm);
+```
+
+**How it works:**
+- Each token bucket tracks last access time
+- 1% probabilistic cleanup check on each access
+- Idle buckets are removed after TTL expires
+- Prevents unbounded memory growth
+- Minimal performance impact (<1%)
+
+**Guidance:**
+- **Low cardinality** (hundreds of keys): No TTL needed
+- **Medium cardinality** (thousands of keys): TTL = 1-24 hours
+- **High cardinality** (millions of keys): TTL = 15-60 minutes
+
+## Observability *(NEW in v0.2.0)*
+
+Enable distributed tracing and metrics for production debugging:
+
+```toml
+# Cargo.toml
+tokio-rate-limit = { version = "0.2", features = ["middleware", "observability"] }
+
+# For metrics collection
+tokio-rate-limit = { version = "0.2", features = ["middleware", "metrics-support"] }
+```
+
+### Distributed Tracing
+
+When `observability` feature is enabled, all rate limit checks create trace spans:
+
+```rust
+use tracing_subscriber;
+
+// Configure tracing subscriber (once at startup)
+tracing_subscriber::fmt::init();
+
+// All rate limit checks now emit spans
+let decision = limiter.check("user-123").await?;
+
+// Span includes:
+// - key: "user-123"
+// - permitted: true/false
+// - remaining: token count
+// - latency: nanoseconds
+```
+
+**Trace Output Example:**
+```
+DEBUG tokio_rate_limit::limiter: Rate limit check: PERMITTED key="user-123" remaining=199
+```
+
+### Metrics
+
+When `metrics-support` feature is enabled:
+
+```rust
+// Metrics automatically recorded:
+// - tokio_rate_limit.requests.allowed (counter)
+// - tokio_rate_limit.requests.denied (counter)
+// - tokio_rate_limit.remaining_tokens (histogram)
+
+// Use any metrics backend (Prometheus, StatsD, etc.)
+use metrics_exporter_prometheus::PrometheusBuilder;
+
+PrometheusBuilder::new()
+    .install()
+    .expect("Failed to install Prometheus exporter");
+```
+
+**Performance Impact:**
+- **No features (default):** Zero overhead
+- **observability:** ~8-19% in microbenchmarks, <0.001% in real HTTP workloads
+- **metrics-support:** ~18-34% in microbenchmarks, <0.001% in real HTTP workloads
+
+See [OBSERVABILITY.md](OBSERVABILITY.md) for comprehensive integration guide with OpenTelemetry, Jaeger, Prometheus, and production best practices.
+
 ## Examples
 
 See the `examples/` directory for complete working examples:
@@ -149,6 +400,8 @@ See the `examples/` directory for complete working examples:
 - [`basic.rs`](examples/basic.rs) - Direct usage without middleware
 - [`axum_middleware.rs`](examples/axum_middleware.rs) - IP-based rate limiting with Axum
 - [`custom_key_extraction.rs`](examples/custom_key_extraction.rs) - User ID and API key rate limiting
+- [`cost_based_limiting.rs`](examples/cost_based_limiting.rs) - Weighted operations *(NEW in v0.2.0)*
+- [`blocking_acquire.rs`](examples/blocking_acquire.rs) - Wait patterns *(NEW in v0.2.0)*
 
 Run examples:
 
@@ -161,6 +414,12 @@ cargo run --example axum_middleware --features middleware
 
 # Custom key extraction (user ID, API key)
 cargo run --example custom_key_extraction --features middleware
+
+# Cost-based limiting
+cargo run --example cost_based_limiting
+
+# Blocking acquire patterns
+cargo run --example blocking_acquire
 ```
 
 ## How It Works
@@ -177,9 +436,10 @@ The library uses a token bucket algorithm for rate limiting:
 
 When a request arrives:
 1. Calculate tokens to refill based on elapsed time
-2. Attempt to consume one token via compare-and-swap (lock-free)
+2. Attempt to consume `cost` tokens via compare-and-swap (lock-free)
 3. If successful, allow the request
 4. If bucket is empty, deny and return retry-after duration
+5. Calculate reset time (when bucket will be full)
 
 ### Architectural Highlights
 
@@ -209,16 +469,21 @@ The `with_shard_count()` method is now deprecated and internally calls the stand
 | Feature | tokio-rate-limit | governor |
 |---------|------------------|----------|
 | **Use Case** | Per-key rate limiting | Global rate limiting |
-| **Performance** | 17.7M ops/sec (single-threaded) | 357M ops/sec (global) |
+| **Performance** | 15.2M ops/sec (single-threaded) | 357M ops/sec (global) |
 | **Key Management** | Built-in per-key tracking | Manual key management |
 | **Middleware** | Axum integration included | DIY middleware |
 | **Algorithm** | Pluggable (token bucket default) | GCRA algorithm |
+| **Standards** | IETF RateLimit headers | Custom headers |
+| **Cost-Based** | ✅ Built-in | ❌ Not supported |
+| **Observability** | ✅ Optional tracing/metrics | ❌ Manual |
 
 **When to use tokio-rate-limit:**
 - You need per-client/per-user/per-IP rate limits
 - You want drop-in Axum middleware
 - You need custom key extraction logic
-- You want pluggable algorithms
+- You want cost-based/weighted rate limiting
+- You need IETF-compliant headers
+- You want optional observability
 
 **When to use governor:**
 - You need a single global rate limit
@@ -230,10 +495,23 @@ Both libraries are excellent choices depending on your use case!
 ## Feature Flags
 
 - `middleware` - Enables Axum middleware support (adds `axum` and `tower` dependencies)
+- `observability` - Enables distributed tracing via `tracing` crate *(NEW in v0.2.0)*
+- `metrics-support` - Enables metrics collection via `metrics` crate (implies `observability`) *(NEW in v0.2.0)*
 
 ## API Documentation
 
 Full API documentation is available at [docs.rs/tokio-rate-limit](https://docs.rs/tokio-rate-limit).
+
+## What's New in v0.2.0
+
+- **IETF RateLimit Headers**: Standards-compliant `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset` headers
+- **Cost-Based Limiting**: `check_with_cost()` for weighted operations
+- **Blocking Acquire**: `acquire()` and `acquire_timeout()` methods
+- **Observability**: Optional tracing and metrics support
+- **Performance**: Migrated from DashMap to flurry for 66-117% improvement at 2-8 threads
+- **Reset Time**: `RateLimitDecision` now includes `reset` field
+
+See [CHANGELOG.md](CHANGELOG.md) for complete release notes.
 
 ## Minimum Supported Rust Version (MSRV)
 
@@ -244,7 +522,8 @@ This crate requires Rust 1.75.0 or later.
 1. **Reuse RateLimiter instances**: Create once, use many times (wrap in `Arc`)
 2. **Choose appropriate burst sizes**: Burst should be ≥ requests_per_second
 3. **Key length**: Shorter keys perform better (IP addresses are fine)
-4. **Cleanup**: Token buckets are created on-demand and never removed (consider periodic cleanup for high-cardinality keys)
+4. **TTL for high-cardinality keys**: Use `TokenBucket::with_ttl()` when you have millions of unique keys
+5. **Observability**: Enable only in production where the operational benefits outweigh the minimal overhead
 
 ## Testing
 
@@ -252,15 +531,19 @@ This crate requires Rust 1.75.0 or later.
 # Run all tests
 cargo test
 
-# Run tests with middleware feature
-cargo test --features middleware
+# Run tests with all features
+cargo test --all-features
 
 # Run benchmarks
 cargo bench
 
+# Run specific benchmark
+cargo bench --bench rate_limit_performance
+
 # Run examples
 cargo run --example basic
 cargo run --example axum_middleware --features middleware
+cargo run --example cost_based_limiting
 ```
 
 ## Contributing
