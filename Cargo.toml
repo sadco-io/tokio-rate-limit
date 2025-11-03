@@ -11,6 +11,7 @@ documentation = "https://docs.rs/tokio-rate-limit"
 keywords = ["rate-limit", "rate-limiting", "token-bucket", "axum", "middleware"]
 categories = ["web-programming", "asynchronous", "network-programming"]
 readme = "README.md"
+exclude = ["ROADMAP.md", "benchmark_results.txt"]
 
 [features]
 default = []

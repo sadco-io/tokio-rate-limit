@@ -1,1 +1,10 @@
 /target
+
+# Development and planning docs (not for crates.io)
+ROADMAP.md
+.DS_Store
+
+# Benchmark artifacts
+benchmark_results.txt
+*.profdata
+*.profraw
