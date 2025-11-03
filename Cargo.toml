@@ -1,6 +1,6 @@
 [package]
 name = "tokio-rate-limit"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75.0"
 authors = ["Daniel Curtis <drc@danielryancurtis.com>"]
@@ -22,7 +22,7 @@ tokio = { version = "1.40", features = ["sync", "time"] }
 
 # Concurrency primitives
 parking_lot = "0.12"
-dashmap = "6.1"
+flurry = "0.5"
 
 # Optional: Axum middleware
 axum = { version = "0.7", optional = true }
@@ -48,6 +48,11 @@ serde_json = "1.0"
 governor = "0.7"
 redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 
+# Alternative concurrent hashmaps for testing
+dashmap = "6.1"
+papaya = "0.1"
+scc = "2.2"
+
 [[bench]]
 name = "rate_limit_performance"
 harness = false
@@ -70,6 +75,10 @@ harness = false
 
 [[bench]]
 name = "false_sharing_test"
+harness = false
+
+[[bench]]
+name = "dashmap_alternatives"
 harness = false
 
 [profile.release]

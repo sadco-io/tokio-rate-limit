@@ -1,6 +1,6 @@
 # tokio-rate-limit
 
-High-performance rate limiting library for Rust with lock-free token accounting, sharded map with fine-grained locking for per-key state, pluggable algorithms, and Axum middleware support.
+High-performance rate limiting library for Rust with lock-free token accounting, lock-free concurrent hashmap for per-key state, pluggable algorithms, and Axum middleware support.
 
 [![Crates.io](https://img.shields.io/crates/v/tokio-rate-limit)](https://crates.io/crates/tokio-rate-limit)
 [![Documentation](https://docs.rs/tokio-rate-limit/badge.svg)](https://docs.rs/tokio-rate-limit)
@@ -9,7 +9,7 @@ High-performance rate limiting library for Rust with lock-free token accounting,
 
 ## Features
 
-- **Blazing Fast**: 17M+ operations/second with lock-free token accounting and sharded concurrent access
+- **Blazing Fast**: 17M+ operations/second with lock-free token accounting and lock-free concurrent hashmap
 - **Per-Key Rate Limiting**: Independent limits per client/IP/user/API key
 - **Memory Safe**: Optional TTL-based eviction for high-cardinality keys
 - **Overflow Protected**: Saturating arithmetic with explicit bounds prevents panics
@@ -22,15 +22,15 @@ High-performance rate limiting library for Rust with lock-free token accounting,
 
 ## Performance
 
-Benchmarks on an Apple M1 Pro (darwin):
+Benchmarks on an Apple M1 Pro (darwin) using flurry's lock-free HashMap:
 
-| Configuration | Latency (P50) | Throughput |
-|--------------|---------------|------------|
-| Single-threaded | 57ns | 17.6M ops/sec |
-| 2 threads | 124ns | 8.1M ops/sec |
-| 4 threads | 132ns | 7.6M ops/sec |
-| 8 threads | 286ns | 3.5M ops/sec |
-| 16 threads | 568ns | 1.76M ops/sec |
+| Configuration | Latency (P50) | Throughput | vs DashMap |
+|--------------|---------------|------------|------------|
+| Single-threaded | 56ns | 17.7M ops/sec | +19% |
+| 2 threads | 64ns | 15.5M ops/sec | +66% |
+| 4 threads | 74ns | 13.5M ops/sec | +69% |
+| 8 threads | 141ns | 7.1M ops/sec | +117% |
+| 16 threads | 406ns | 2.5M ops/sec | +40% |
 
 **Key Insight**: Our library excels at per-key rate limiting (separate limits per client), while libraries like `governor` are optimized for global rate limiting (single limit for all requests). Both have their use cases, and this library fills the per-key niche with excellent performance.
 
@@ -173,7 +173,7 @@ The library uses a token bucket algorithm for rate limiting:
 - **Refill Rate**: Tokens added per second (e.g., 100 tokens/sec)
 - **Per-Key Buckets**: Each client/user/key has an independent bucket
 - **Lock-Free Token Accounting**: Uses atomic operations for token updates without locks
-- **Sharded State Management**: DashMap provides fine-grained per-shard locking for key lookup
+- **Lock-Free State Management**: flurry provides lock-free concurrent hashmap for key lookup
 
 When a request arrives:
 1. Calculate tokens to refill based on elapsed time
@@ -183,58 +183,33 @@ When a request arrives:
 
 ### Architectural Highlights
 
-- **DashMap**: Concurrent hashmap with sharded locking for per-key token buckets (default 16 shards)
+- **flurry**: Lock-free concurrent hashmap (Java ConcurrentHashMap port) for per-key token buckets
 - **Lock-Free Token Updates**: Atomic compare-and-swap operations on token counts
+- **Auto-Tuning**: flurry automatically tunes internal parameters for optimal performance
 - **Precision**: 1000x scaling factor for sub-token precision
 - **Zero Allocations**: Hot path avoids heap allocations
 
-**Note on "Lock-Free"**: The token accounting itself uses true lock-free atomic operations. However, accessing per-key state in the DashMap uses fine-grained sharded locking (each shard has its own lock). This provides excellent concurrency while maintaining per-key isolation. For truly lock-free key access, alternatives like `evmap` could be considered, though they have different consistency trade-offs.
+The entire hot path is lock-free, using atomic operations for both token accounting and key access.
 
 ## Performance Tuning
 
-The library includes CPU-aware auto-tuning of DashMap's shard count for optimal multi-threaded performance. By default, the shard count is calculated as `(num_cpus * 4).next_power_of_two().max(32)`.
+As of v0.2.0, the library uses flurry's lock-free concurrent hashmap which automatically tunes its internal parameters for optimal performance across different workloads and thread counts. No manual tuning is required.
 
-### Auto-Tuning Behavior
+**Performance improvements in v0.2.0:**
+- **Single-threaded:** +19% improvement over DashMap
+- **2 threads:** +66% improvement over DashMap
+- **4 threads:** +69% improvement over DashMap
+- **8 threads:** +117% improvement over DashMap
+- **16 threads:** +40% improvement over DashMap
 
-| CPU Cores | Shards | Best For |
-|-----------|--------|----------|
-| 4-8       | 32     | Low-medium contention workloads |
-| 12-16     | 64     | Balanced production systems |
-| 32+       | 128+   | High-contention scenarios |
-
-### Manual Tuning (Advanced)
-
-For specialized workloads, you can manually specify the shard count:
-
-```rust
-use tokio_rate_limit::algorithm::TokenBucket;
-
-// For 2-4 threads
-let bucket = TokenBucket::with_shard_count(200, 100, 32);
-
-// For 4-8 threads
-let bucket = TokenBucket::with_shard_count(200, 100, 64);
-
-// For 8-16 threads
-let bucket = TokenBucket::with_shard_count(200, 100, 128);
-
-// For 16+ threads or high contention
-let bucket = TokenBucket::with_shard_count(200, 100, 256);
-```
-
-**Performance Impact:**
-- **8 threads:** Up to 11% improvement with tuned shards
-- **16 threads:** Up to 15% improvement with tuned shards
-- **Memory overhead:** ~16KB for 256 shards (negligible)
-
-See [SHARD_TUNING_RESULTS.md](SHARD_TUNING_RESULTS.md) for detailed benchmarks.
+The `with_shard_count()` method is now deprecated and internally calls the standard constructor, as flurry does not expose shard configuration.
 
 ## Comparison with Governor
 
 | Feature | tokio-rate-limit | governor |
 |---------|------------------|----------|
 | **Use Case** | Per-key rate limiting | Global rate limiting |
-| **Performance** | 14M ops/sec (single-threaded) | 357M ops/sec (global) |
+| **Performance** | 17.7M ops/sec (single-threaded) | 357M ops/sec (global) |
 | **Key Management** | Built-in per-key tracking | Manual key management |
 | **Middleware** | Axum integration included | DIY middleware |
 | **Algorithm** | Pluggable (token bucket default) | GCRA algorithm |
@@ -304,7 +279,7 @@ at your option.
 ## Acknowledgments
 
 - Inspired by [governor](https://github.com/benwis/governor) for Rust rate limiting
-- Uses [DashMap](https://github.com/xacrimon/dashmap) for concurrent key-value storage
+- Uses [flurry](https://github.com/jonhoo/flurry) for lock-free concurrent hashmap (Java ConcurrentHashMap port)
 - Built with [Tokio](https://tokio.rs) for async runtime
 - Axum middleware support via [Tower](https://github.com/tower-rs/tower)
 
