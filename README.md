@@ -5,7 +5,6 @@ High-performance rate limiting library for Rust with lock-free token accounting,
 [![Crates.io](https://img.shields.io/crates/v/tokio-rate-limit)](https://crates.io/crates/tokio-rate-limit)
 [![Documentation](https://docs.rs/tokio-rate-limit/badge.svg)](https://docs.rs/tokio-rate-limit)
 [![License](https://img.shields.io/crates/l/tokio-rate-limit)](LICENSE-MIT)
-[![Build Status](https://img.shields.io/github/workflow/status/danielrcurtis/tokio-rate-limit/CI)](https://github.com/danielrcurtis/tokio-rate-limit/actions)
 
 **Performance:** 15.2M ops/sec single-threaded | 8.0M ops/sec on 4 cores | Sub-microsecond P99 latency
 
