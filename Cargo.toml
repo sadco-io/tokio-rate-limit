@@ -91,6 +91,10 @@ harness = false
 name = "dashmap_alternatives"
 harness = false
 
+[[bench]]
+name = "algorithm_comparison"
+harness = false
+
 [profile.release]
 lto = true
 codegen-units = 1

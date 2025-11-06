@@ -73,7 +73,7 @@ Benchmarks on an Apple M1 Pro (darwin) using flurry's lock-free HashMap:
 - With tracing: 12.8M ops/sec (-16%, but <0.001% in real HTTP workloads)
 - With metrics: 12.9M ops/sec (-15%, negligible in production)
 
-See [ENHANCED_API_BENCHMARKS.md](ENHANCED_API_BENCHMARKS.md) for detailed performance analysis.
+See [ENHANCED_API_BENCHMARKS.md](ENHANCED_API_BENCHMARKS.md) for detailed performance analysis and [ALGORITHM_BENCHMARKS.md](ALGORITHM_BENCHMARKS.md) for TokenBucket vs LeakyBucket comparison.
 
 **Key Insight**: Our library excels at **per-key rate limiting** (separate limits per client), while libraries like `governor` are optimized for **global rate limiting** (single limit for all requests). Both have their use cases, and this library fills the per-key niche with excellent performance.
 
@@ -367,6 +367,9 @@ let limiter = RateLimiter::from_algorithm(algorithm);
 | **Traffic Pattern** | Bursty | Smooth |
 | **Best For** | Public APIs, users | Backend protection |
 | **Predictability** | Moderate | High |
+| **Performance** | 15.1M ops/sec | 14.1M ops/sec |
+
+Both algorithms are virtually identical in performance (within 3-7%). See [ALGORITHM_BENCHMARKS.md](ALGORITHM_BENCHMARKS.md) for detailed benchmark results.
 
 **When to Choose:**
 
