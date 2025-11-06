@@ -200,6 +200,27 @@ impl RateLimiter {
         }
     }
 
+    /// Creates a new rate limiter with a custom algorithm.
+    ///
+    /// This allows you to use alternative algorithms like [`LeakyBucket`](crate::algorithm::LeakyBucket)
+    /// instead of the default [`TokenBucket`](crate::algorithm::TokenBucket).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tokio_rate_limit::RateLimiter;
+    /// use tokio_rate_limit::algorithm::LeakyBucket;
+    ///
+    /// // Create a leaky bucket with capacity 50, leak rate 100/sec
+    /// let algorithm = LeakyBucket::new(50, 100);
+    /// let limiter = RateLimiter::from_algorithm(algorithm);
+    /// ```
+    pub fn from_algorithm<A: Algorithm + 'static>(algorithm: A) -> Self {
+        Self {
+            algorithm: Box::new(algorithm),
+        }
+    }
+
     /// Creates a new builder for configuring a rate limiter.
     ///
     /// # Examples

@@ -4,16 +4,43 @@ use crate::error::Result;
 use crate::limiter::RateLimitDecision;
 use async_trait::async_trait;
 
+mod leaky_bucket;
 mod token_bucket;
 
+pub use leaky_bucket::LeakyBucket;
 pub use token_bucket::TokenBucket;
+
+/// Private module for the sealed trait pattern.
+///
+/// This prevents external implementations of the Algorithm trait while maintaining
+/// flexibility for internal algorithm implementations. This allows us to make
+/// breaking changes to the trait in the future without requiring a semver major bump.
+mod private {
+    pub trait Sealed {}
+}
 
 /// Trait for rate limiting algorithms.
 ///
 /// Implementations of this trait define how rate limiting decisions are made.
 /// The trait is async to allow for potential I/O operations in custom implementations.
+///
+/// # Sealed Trait
+///
+/// This trait is sealed and cannot be implemented outside of this crate. This design
+/// allows us to add new methods or change the trait in minor version updates without
+/// breaking semver guarantees. If you need a custom algorithm, please open an issue
+/// to discuss adding it to the library.
+///
+/// # Available Algorithms
+///
+/// - [`TokenBucket`] - Allows bursts up to capacity, refills at constant rate
+/// - [`LeakyBucket`] - Enforces steady rate, smooths traffic (NEW in v0.3.0)
+///
+/// # Planned Algorithms
+///
+/// - Sliding Window (future) - More precise rate limiting
 #[async_trait]
-pub trait Algorithm: Send + Sync {
+pub trait Algorithm: Send + Sync + private::Sealed {
     /// Checks if a request for the given key should be permitted.
     ///
     /// # Arguments

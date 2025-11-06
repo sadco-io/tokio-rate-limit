@@ -49,7 +49,7 @@ That's where `tokio-rate-limit` shines:
 - **Cost-Based Limiting**: Different token costs for different operations *(NEW in v0.2.0)*
 - **Blocking Acquire**: Wait for tokens with `acquire()` and `acquire_timeout()` *(NEW in v0.2.0)*
 - **Observability**: Optional tracing and metrics with zero overhead when disabled *(NEW in v0.2.0)*
-- **Pluggable Algorithms**: Token bucket included, extensible for custom algorithms
+- **Pluggable Algorithms**: Token bucket and leaky bucket algorithms, sealed for API stability *(NEW in v0.3.0)*
 - **Axum Middleware**: Drop-in middleware for Axum web applications with proper headers
 - **Custom Key Extraction**: Rate limit by IP, user ID, API key, or any custom logic
 - **Deterministic Testing**: Uses tokio::time for testable time controls
@@ -300,6 +300,81 @@ let app: Router = Router::new()
     ));
 ```
 
+## Algorithms *(NEW in v0.3.0)*
+
+This library provides two rate limiting algorithms with different characteristics:
+
+### Token Bucket (Default)
+
+The token bucket algorithm allows bursts up to capacity and refills at a constant rate.
+
+**Characteristics:**
+- Allows bursts up to bucket capacity
+- Refills at constant rate (tokens/second)
+- Good for accommodating bursty traffic
+- Permits temporary spikes in usage
+
+**Best For:**
+- Public APIs and user-facing services
+- Mobile applications with intermittent connectivity
+- Scenarios where users expect burst capability
+- General-purpose rate limiting
+
+**Example:**
+```rust
+use tokio_rate_limit::RateLimiter;
+
+// Token bucket: 100/sec rate, burst of 200
+let limiter = RateLimiter::builder()
+    .requests_per_second(100)
+    .burst(200)
+    .build()
+    .unwrap();
+```
+
+### Leaky Bucket *(NEW in v0.3.0)*
+
+The leaky bucket algorithm enforces a steady rate by "leaking" tokens at a constant rate.
+
+**Characteristics:**
+- Enforces strict steady rate, no bursts
+- Smooths traffic into consistent flow
+- Requests add tokens to bucket; overflow = deny
+- More predictable load on downstream services
+
+**Best For:**
+- Backend protection and rate smoothing
+- Strict QPS enforcement requirements
+- Preventing overwhelming downstream services
+- Fair queuing scenarios
+
+**Example:**
+```rust
+use tokio_rate_limit::RateLimiter;
+use tokio_rate_limit::algorithm::LeakyBucket;
+
+// Leaky bucket: capacity 50, leak rate 100/sec
+let algorithm = LeakyBucket::new(50, 100);
+let limiter = RateLimiter::from_algorithm(algorithm);
+```
+
+### Comparison
+
+| Feature | Token Bucket | Leaky Bucket |
+|---------|--------------|--------------|
+| **Bursts** | ✅ Allowed (up to capacity) | ❌ Not allowed |
+| **Rate Enforcement** | Average over time | Strict steady rate |
+| **Traffic Pattern** | Bursty | Smooth |
+| **Best For** | Public APIs, users | Backend protection |
+| **Predictability** | Moderate | High |
+
+**When to Choose:**
+
+- **Token Bucket**: When users expect burst capability (e.g., uploading multiple files, batch operations)
+- **Leaky Bucket**: When protecting backends from overload (e.g., database query limiting, API gateway)
+
+See `examples/leaky_bucket.rs` for a detailed comparison with examples.
+
 ## Memory Safety and TTL Eviction
 
 By default, token buckets are created on-demand and persist indefinitely. For high-cardinality keys (e.g., per-IP limits with millions of IPs), use TTL-based eviction:
@@ -401,6 +476,7 @@ See the `examples/` directory for complete working examples:
 - [`custom_key_extraction.rs`](examples/custom_key_extraction.rs) - User ID and API key rate limiting
 - [`cost_based_limiting.rs`](examples/cost_based_limiting.rs) - Weighted operations *(NEW in v0.2.0)*
 - [`blocking_acquire.rs`](examples/blocking_acquire.rs) - Wait patterns *(NEW in v0.2.0)*
+- [`leaky_bucket.rs`](examples/leaky_bucket.rs) - Algorithm comparison: token vs leaky bucket *(NEW in v0.3.0)*
 
 Run examples:
 
@@ -419,6 +495,9 @@ cargo run --example cost_based_limiting
 
 # Blocking acquire patterns
 cargo run --example blocking_acquire
+
+# Leaky bucket algorithm comparison
+cargo run --example leaky_bucket
 ```
 
 ## How It Works
@@ -501,16 +580,14 @@ Both libraries are excellent choices depending on your use case!
 
 Full API documentation is available at [docs.rs/tokio-rate-limit](https://docs.rs/tokio-rate-limit).
 
-## What's New in v0.2.0
+## What's New in v0.3.0
 
-- **IETF RateLimit Headers**: Standards-compliant `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset` headers
-- **Cost-Based Limiting**: `check_with_cost()` for weighted operations
-- **Blocking Acquire**: `acquire()` and `acquire_timeout()` methods
-- **Observability**: Optional tracing and metrics support
-- **Performance**: Migrated from DashMap to flurry for 66-117% improvement at 2-8 threads
-- **Reset Time**: `RateLimitDecision` now includes `reset` field
+- **Leaky Bucket Algorithm**: New algorithm for enforcing steady rate without bursts
+- **Sealed Algorithm Trait**: Trait is now sealed for API stability, allows non-breaking changes
+- **from_algorithm()**: Create RateLimiter with custom algorithms (TokenBucket or LeakyBucket)
+- **Algorithm Comparison**: New example demonstrating differences between algorithms
 
-See [CHANGELOG.md](CHANGELOG.md) for complete release notes.
+See [CHANGELOG.md](CHANGELOG.md) for complete release notes and v0.2.0 features.
 
 ## Minimum Supported Rust Version (MSRV)
 

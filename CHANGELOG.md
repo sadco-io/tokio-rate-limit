@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.3.0] - TBD
+
+### Added
+
+- **Leaky Bucket Algorithm**
+  - New `LeakyBucket` algorithm for enforcing steady rate without bursts
+  - Smooths traffic into consistent flow
+  - Better for backend protection and strict QPS enforcement
+  - Similar performance characteristics to TokenBucket
+  - Supports TTL-based eviction like TokenBucket
+  - Full support for cost-based limiting
+
+- **Sealed Algorithm Trait**
+  - Algorithm trait is now sealed using the sealed trait pattern
+  - Prevents external implementations while maintaining internal flexibility
+  - Allows future trait changes without semver major bump
+  - Improves API stability guarantees
+
+- **from_algorithm() Constructor**
+  - New `RateLimiter::from_algorithm()` method
+  - Create RateLimiter with custom algorithms (TokenBucket or LeakyBucket)
+  - Enables algorithm selection at runtime
+
+### Documentation
+
+- **Algorithm Comparison Section** in README
+  - Detailed comparison of TokenBucket vs LeakyBucket
+  - Use case guidance for each algorithm
+  - Performance characteristics
+  - Example code for both algorithms
+
+- **New Example**: `leaky_bucket.rs`
+  - Demonstrates differences between token and leaky bucket algorithms
+  - Shows burst behavior vs steady rate enforcement
+  - Includes cost-based limiting examples
+  - Real-world use case guidance
+
+### Changed
+
+- Algorithm trait is now sealed (breaking change for external implementations)
+  - No user-visible impact if not implementing custom algorithms
+  - Custom algorithms were never officially supported
+
+### Performance
+
+- LeakyBucket expected to match TokenBucket performance (15M+ ops/sec)
+- Minimal overhead for algorithm selection
+
 ## [0.2.0] - 2025-11-03
 
 Initial release of tokio-rate-limit, a high-performance, lock-free rate limiting library for Rust.

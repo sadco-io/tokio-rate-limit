@@ -415,6 +415,9 @@ impl TokenBucket {
     }
 }
 
+// Implement the sealed trait marker
+impl super::private::Sealed for TokenBucket {}
+
 #[async_trait]
 impl Algorithm for TokenBucket {
     async fn check(&self, key: &str) -> Result<RateLimitDecision> {
