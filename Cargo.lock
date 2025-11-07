@@ -1774,7 +1774,7 @@ dependencies = [
 
 [[package]]
 name = "tokio-rate-limit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "axum 0.7.9",

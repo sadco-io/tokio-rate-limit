@@ -12,6 +12,9 @@ mod cached_token_bucket;
 mod simd_token_bucket;
 mod zerocopy_token_bucket;
 
+// v0.7.0 probabilistic rate limiting
+mod probabilistic_token_bucket;
+
 pub use leaky_bucket::LeakyBucket;
 pub use token_bucket::TokenBucket;
 
@@ -19,6 +22,9 @@ pub use token_bucket::TokenBucket;
 pub use cached_token_bucket::CachedTokenBucket;
 pub use simd_token_bucket::SimdTokenBucket;
 pub use zerocopy_token_bucket::ZeroCopyTokenBucket;
+
+// Probabilistic exports (v0.7.0)
+pub use probabilistic_token_bucket::ProbabilisticTokenBucket;
 
 /// Private module for the sealed trait pattern.
 ///

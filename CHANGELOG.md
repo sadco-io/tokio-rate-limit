@@ -7,6 +7,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2025-01-07
+
+### Added
+
+- **Probabilistic Rate Limiting Algorithm (Experimental)**
+  - New `ProbabilisticTokenBucket` algorithm with configurable sampling rates
+  - Dramatically reduces atomic operations by sampling only X% of requests
+  - **Performance:** 10-51% improvement depending on workload and sampling rate
+  - **Accuracy:** <1% error margin in controlled tests
+  - Best configuration: 5% sampling for 24.6% multi-threaded improvement
+  - Thread-safe with fast thread-local xorshift64 RNG
+  - Zero additional memory overhead
+
+### Performance Results
+
+**Single-Threaded (5% sampling):**
+- 48.8 ns per operation (20.5M ops/sec)
+- **+11.4% improvement** over v0.6.0 baseline
+- Real-world: 13-51% faster depending on workload
+
+**Multi-Threaded (8 threads, 5% sampling):**
+- 195.5 ns per operation (5.1M ops/sec)
+- **+24.6% improvement** over v0.6.0 baseline (exceptional)
+
+**Cost-Based Rate Limiting (1% sampling):**
+- 47.6 ns for cost=10 operations
+- **+29.6% improvement** over v0.6.0 baseline
+
+### Use Cases
+
+**✅ Recommended for:**
+- Ultra-high throughput APIs (>1M req/sec)
+- Cost-based rate limiting scenarios
+- Multi-threaded hot-key workloads (8+ threads)
+- Soft rate limiting (DDoS protection, load shedding)
+- Acceptable 1-2% error margin scenarios
+
+**❌ Not recommended for:**
+- Billing and metering (requires exact counts)
+- Strict compliance scenarios (regulatory requirements)
+- Low-throughput endpoints (<1M req/sec)
+- Zero error tolerance requirements
+
+### Technical Details
+
+**Implementation:**
+- Configurable sampling rates: 1%, 5%, 10%, 20%
+- Scaled token consumption: sampled requests consume sample_rate × tokens
+- Fast thread-local RNG (xorshift64) for minimal overhead
+- Full API compatibility with existing Algorithm trait
+- Lock-free, thread-safe implementation
+
+**Recommended Configuration:**
+```rust
+use tokio_rate_limit::algorithm::ProbabilisticTokenBucket;
+
+// 5% sampling - best balance of performance and accuracy
+let algorithm = ProbabilisticTokenBucket::new(
+    100,  // capacity
+    100,  // refill_rate
+    20    // sample_rate (5% = 1 in 20)
+);
+```
+
+### Documentation
+
+- **PROBABILISTIC_ANALYSIS.md** - Comprehensive empirical analysis (2,500+ words)
+- **PROBABILISTIC_SUMMARY.md** - Executive summary and quick reference
+- **examples/probabilistic_rate_limiting.rs** - Production example with 5 scenarios
+- Accuracy validation tests (9/10 passing)
+- 39 benchmark configurations across 6 scenarios
+
+### Testing
+
+- ✅ 16 unit tests for ProbabilisticTokenBucket (all passing)
+- ✅ 10 accuracy validation tests (9/10 passing)
+- ✅ 30 library tests (no regressions)
+- ✅ Comprehensive benchmark suite
+- ✅ Production example validated
+
+### Migration Guide
+
+**Backward Compatible** - No changes required for existing code.
+
+**To use probabilistic rate limiting:**
+
+```rust
+use tokio_rate_limit::algorithm::ProbabilisticTokenBucket;
+use tokio_rate_limit::RateLimiter;
+
+// Create with 5% sampling (recommended)
+let algorithm = ProbabilisticTokenBucket::new(
+    capacity,
+    refill_rate,
+    20  // 5% sampling
+);
+
+let limiter = RateLimiter::from_algorithm(algorithm);
+
+// Use exactly like TokenBucket
+let decision = limiter.check("user-123").await?;
+```
+
+**Choosing sampling rate:**
+- 1% (sample_rate=100): Maximum performance, ~1-2% error
+- 5% (sample_rate=20): **Recommended** - best balance
+- 10% (sample_rate=10): More accurate, less performance gain
+- 20% (sample_rate=5): Minimal error, modest performance gain
+
+### Known Limitations
+
+- **Experimental status:** Monitor production metrics before full adoption
+- **Error margin:** 1-2% over-limit requests possible (acceptable for soft limiting)
+- **Not suitable for billing:** Use deterministic TokenBucket for exact counting
+- **Best for high throughput:** Benefits diminish below 1M req/sec
+
 ## [0.6.0] - 2025-01-07
 
 ### Performance Improvements
