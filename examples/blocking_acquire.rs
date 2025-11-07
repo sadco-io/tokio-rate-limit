@@ -31,7 +31,11 @@ async fn main() {
     for i in 1..=12 {
         match limiter.try_acquire(client).await {
             Ok(decision) if decision.permitted => {
-                println!("Request {}: ✓ Permitted (remaining: {})", i, decision.remaining.unwrap());
+                println!(
+                    "Request {}: ✓ Permitted (remaining: {})",
+                    i,
+                    decision.remaining.unwrap()
+                );
             }
             Ok(decision) => {
                 println!(
@@ -61,7 +65,10 @@ async fn main() {
     // Try to acquire with timeout
     println!("\nAttempting acquire with 3-second timeout...");
     let start = std::time::Instant::now();
-    match limiter.acquire_timeout(client, Duration::from_secs(3)).await {
+    match limiter
+        .acquire_timeout(client, Duration::from_secs(3))
+        .await
+    {
         Ok(decision) if decision.permitted => {
             let elapsed = start.elapsed();
             println!(

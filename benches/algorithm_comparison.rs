@@ -6,9 +6,7 @@
 //! - TokenBucket: Allows bursts, better for bursty workloads
 //! - LeakyBucket: Enforces steady rate, better for backend protection
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -372,38 +370,30 @@ fn cost_based_comparison(c: &mut Criterion) {
 
     for cost in [1, 10, 100] {
         // TokenBucket
-        group.bench_with_input(
-            BenchmarkId::new("token_bucket", cost),
-            &cost,
-            |b, &cost| {
-                let algorithm = TokenBucket::new(1_000_000, 1_000_000);
-                let limiter = RateLimiter::from_algorithm(algorithm);
+        group.bench_with_input(BenchmarkId::new("token_bucket", cost), &cost, |b, &cost| {
+            let algorithm = TokenBucket::new(1_000_000, 1_000_000);
+            let limiter = RateLimiter::from_algorithm(algorithm);
 
-                b.to_async(&rt).iter(|| async {
-                    let result = limiter
-                        .check_with_cost(black_box("test-key"), black_box(cost))
-                        .await;
-                    black_box(result)
-                });
-            },
-        );
+            b.to_async(&rt).iter(|| async {
+                let result = limiter
+                    .check_with_cost(black_box("test-key"), black_box(cost))
+                    .await;
+                black_box(result)
+            });
+        });
 
         // LeakyBucket
-        group.bench_with_input(
-            BenchmarkId::new("leaky_bucket", cost),
-            &cost,
-            |b, &cost| {
-                let algorithm = LeakyBucket::new(1_000_000, 1_000_000);
-                let limiter = RateLimiter::from_algorithm(algorithm);
+        group.bench_with_input(BenchmarkId::new("leaky_bucket", cost), &cost, |b, &cost| {
+            let algorithm = LeakyBucket::new(1_000_000, 1_000_000);
+            let limiter = RateLimiter::from_algorithm(algorithm);
 
-                b.to_async(&rt).iter(|| async {
-                    let result = limiter
-                        .check_with_cost(black_box("test-key"), black_box(cost))
-                        .await;
-                    black_box(result)
-                });
-            },
-        );
+            b.to_async(&rt).iter(|| async {
+                let result = limiter
+                    .check_with_cost(black_box("test-key"), black_box(cost))
+                    .await;
+                black_box(result)
+            });
+        });
     }
 
     group.finish();

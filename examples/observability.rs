@@ -39,7 +39,9 @@ async fn main() {
     #[cfg(not(feature = "metrics-support"))]
     {
         println!("Note: Run with --features metrics-support to see metrics");
-        println!("Example: cargo run --example observability --features observability,metrics-support\n");
+        println!(
+            "Example: cargo run --example observability --features observability,metrics-support\n"
+        );
     }
 
     // Create a rate limiter

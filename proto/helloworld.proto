@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package helloworld;
+
+// The greeting service definition.
+service Greeter {
+  // Sends a greeting
+  rpc SayHello (HelloRequest) returns (HelloReply);
+
+  // Sends multiple greetings (demonstrating different rate limits per method)
+  rpc SayHelloMany (HelloRequest) returns (stream HelloReply);
+
+  // A more expensive operation (could have a lower rate limit)
+  rpc ProcessData (DataRequest) returns (DataReply);
+}
+
+// The request message containing the user's name.
+message HelloRequest {
+  string name = 1;
+}
+
+// The response message containing the greetings.
+message HelloReply {
+  string message = 1;
+}
+
+// Request for data processing (simulates expensive operation)
+message DataRequest {
+  string data = 1;
+  int32 complexity = 2;
+}
+
+// Response from data processing
+message DataReply {
+  string result = 1;
+  int32 processing_time_ms = 2;
+}

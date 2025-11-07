@@ -49,6 +49,9 @@ mod limiter;
 #[cfg(feature = "middleware")]
 pub mod middleware;
 
+#[cfg(feature = "tonic-support")]
+pub mod tonic_middleware;
+
 pub use error::{Error, Result};
 pub use limiter::{RateLimitDecision, RateLimiter, RateLimiterBuilder, RateLimiterConfig};
 

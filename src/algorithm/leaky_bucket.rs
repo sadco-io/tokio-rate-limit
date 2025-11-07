@@ -496,10 +496,7 @@ mod tests {
 
         // Should work again
         let decision = bucket.check("test-key").await.unwrap();
-        assert!(
-            decision.permitted,
-            "Request should be permitted after leak"
-        );
+        assert!(decision.permitted, "Request should be permitted after leak");
     }
 
     #[tokio::test]

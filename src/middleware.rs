@@ -229,7 +229,8 @@ where
                 {
                     metrics::counter!("tokio_rate_limit.requests.allowed").increment(1);
                     if let Some(remaining) = decision.remaining {
-                        metrics::histogram!("tokio_rate_limit.remaining_tokens").record(remaining as f64);
+                        metrics::histogram!("tokio_rate_limit.remaining_tokens")
+                            .record(remaining as f64);
                     }
                 }
 
@@ -242,7 +243,8 @@ where
                 {
                     metrics::counter!("tokio_rate_limit.requests.denied").increment(1);
                     if let Some(remaining) = decision.remaining {
-                        metrics::histogram!("tokio_rate_limit.remaining_tokens").record(remaining as f64);
+                        metrics::histogram!("tokio_rate_limit.remaining_tokens")
+                            .record(remaining as f64);
                     }
                 }
 

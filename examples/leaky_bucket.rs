@@ -164,9 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         decision.remaining.unwrap()
     );
     if !decision.permitted {
-        println!(
-            "  Note: Request would overflow bucket (50 used + 60 needed > 100 capacity)"
-        );
+        println!("  Note: Request would overflow bucket (50 used + 60 needed > 100 capacity)");
     }
 
     println!();
@@ -186,7 +184,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("Use Cases:");
     println!("  - Token Bucket: When users expect burst capability (e.g., mobile apps)");
-    println!("  - Leaky Bucket: When protecting backends from overload (e.g., database rate limiting)");
+    println!(
+        "  - Leaky Bucket: When protecting backends from overload (e.g., database rate limiting)"
+    );
 
     Ok(())
 }

@@ -16,6 +16,7 @@ exclude = ["ROADMAP.md", "benchmark_results.txt"]
 [features]
 default = []
 middleware = ["axum", "tower"]
+tonic-support = ["tonic", "tower", "http"]
 observability = ["tracing"]
 metrics-support = ["metrics", "observability"]
 
@@ -30,6 +31,10 @@ flurry = "0.5"
 # Optional: Axum middleware
 axum = { version = "0.7", optional = true }
 tower = { version = "0.5", optional = true }
+
+# Optional: Tonic gRPC middleware
+tonic = { version = "0.12", optional = true }
+http = { version = "1.0", optional = true }
 
 # Optional: Observability
 tracing = { version = "0.1", optional = true }
@@ -51,6 +56,12 @@ http-body-util = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
+# For gRPC examples
+tonic = "0.12"
+prost = "0.13"
+tokio-stream = { version = "0.1", features = ["sync"] }
+http = "1.0"
+
 # For observability example
 tracing-subscriber = "0.3"
 
@@ -62,6 +73,9 @@ redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 dashmap = "6.1"
 papaya = "0.1"
 scc = "2.2"
+
+[build-dependencies]
+tonic-build = "0.12"
 
 [[bench]]
 name = "rate_limit_performance"
@@ -97,6 +111,10 @@ harness = false
 
 [[bench]]
 name = "v0_6_optimizations"
+harness = false
+
+[[bench]]
+name = "tonic_middleware_bench"
 harness = false
 
 [profile.release]

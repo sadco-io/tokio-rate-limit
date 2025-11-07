@@ -98,7 +98,11 @@ impl AtomicTokenState {
 
             if updated_tokens >= token_cost {
                 let new_tokens = updated_tokens.saturating_sub(token_cost);
-                let new_time = if new_tokens_to_add > 0 { now_nanos } else { last_refill };
+                let new_time = if new_tokens_to_add > 0 {
+                    now_nanos
+                } else {
+                    last_refill
+                };
 
                 match self.tokens.compare_exchange_weak(
                     current_tokens,
@@ -120,7 +124,11 @@ impl AtomicTokenState {
                     Err(_) => continue,
                 }
             } else {
-                let new_time = if new_tokens_to_add > 0 { now_nanos } else { last_refill };
+                let new_time = if new_tokens_to_add > 0 {
+                    now_nanos
+                } else {
+                    last_refill
+                };
 
                 match self.tokens.compare_exchange_weak(
                     current_tokens,
@@ -274,7 +282,10 @@ impl CachedTokenBucket {
             let key_string = key.to_string();
             let new_state = Arc::new(AtomicTokenState::new(self.capacity, now_nanos));
 
-            match self.tokens.try_insert(key_string.clone(), new_state.clone(), guard) {
+            match self
+                .tokens
+                .try_insert(key_string.clone(), new_state.clone(), guard)
+            {
                 Ok(_) => new_state,
                 Err(current) => current.current.clone(),
             }

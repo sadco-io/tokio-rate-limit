@@ -27,10 +27,16 @@ async fn main() {
     println!("1. Light operation (cost=1):");
     match limiter.check_with_cost(client, 1).await {
         Ok(decision) if decision.permitted => {
-            println!("   ✓ Permitted - Remaining: {}", decision.remaining.unwrap());
+            println!(
+                "   ✓ Permitted - Remaining: {}",
+                decision.remaining.unwrap()
+            );
         }
         Ok(decision) => {
-            println!("   ✗ Denied - Retry after: {:?}", decision.retry_after.unwrap());
+            println!(
+                "   ✗ Denied - Retry after: {:?}",
+                decision.retry_after.unwrap()
+            );
         }
         Err(e) => eprintln!("   Error: {}", e),
     }
@@ -39,10 +45,16 @@ async fn main() {
     println!("\n2. Medium operation (cost=10):");
     match limiter.check_with_cost(client, 10).await {
         Ok(decision) if decision.permitted => {
-            println!("   ✓ Permitted - Remaining: {}", decision.remaining.unwrap());
+            println!(
+                "   ✓ Permitted - Remaining: {}",
+                decision.remaining.unwrap()
+            );
         }
         Ok(decision) => {
-            println!("   ✗ Denied - Retry after: {:?}", decision.retry_after.unwrap());
+            println!(
+                "   ✗ Denied - Retry after: {:?}",
+                decision.retry_after.unwrap()
+            );
         }
         Err(e) => eprintln!("   Error: {}", e),
     }
@@ -51,10 +63,16 @@ async fn main() {
     println!("\n3. Heavy operation (cost=50):");
     match limiter.check_with_cost(client, 50).await {
         Ok(decision) if decision.permitted => {
-            println!("   ✓ Permitted - Remaining: {}", decision.remaining.unwrap());
+            println!(
+                "   ✓ Permitted - Remaining: {}",
+                decision.remaining.unwrap()
+            );
         }
         Ok(decision) => {
-            println!("   ✗ Denied - Retry after: {:?}", decision.retry_after.unwrap());
+            println!(
+                "   ✗ Denied - Retry after: {:?}",
+                decision.retry_after.unwrap()
+            );
         }
         Err(e) => eprintln!("   Error: {}", e),
     }
@@ -63,10 +81,16 @@ async fn main() {
     println!("\n4. Very heavy operation (cost=100):");
     match limiter.check_with_cost(client, 100).await {
         Ok(decision) if decision.permitted => {
-            println!("   ✓ Permitted - Remaining: {}", decision.remaining.unwrap());
+            println!(
+                "   ✓ Permitted - Remaining: {}",
+                decision.remaining.unwrap()
+            );
         }
         Ok(decision) => {
-            println!("   ✗ Denied - Retry after: {:?}", decision.retry_after.unwrap());
+            println!(
+                "   ✗ Denied - Retry after: {:?}",
+                decision.retry_after.unwrap()
+            );
         }
         Err(e) => eprintln!("   Error: {}", e),
     }
@@ -75,7 +99,10 @@ async fn main() {
     println!("\n5. Another operation (cost=50):");
     match limiter.check_with_cost(client, 50).await {
         Ok(decision) if decision.permitted => {
-            println!("   ✓ Permitted - Remaining: {}", decision.remaining.unwrap());
+            println!(
+                "   ✓ Permitted - Remaining: {}",
+                decision.remaining.unwrap()
+            );
         }
         Ok(decision) => {
             println!(
@@ -91,7 +118,10 @@ async fn main() {
     println!("\n6. Using try_acquire_n (cost=1):");
     match limiter.try_acquire_n(client, 1).await {
         Ok(decision) if decision.permitted => {
-            println!("   ✓ Permitted - Remaining: {}", decision.remaining.unwrap());
+            println!(
+                "   ✓ Permitted - Remaining: {}",
+                decision.remaining.unwrap()
+            );
         }
         Ok(decision) => {
             println!(

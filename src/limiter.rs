@@ -440,11 +440,7 @@ impl RateLimiter {
     /// # }
     /// ```
     #[cfg_attr(feature = "observability", instrument(skip(self), fields(key = %key, timeout_ms = timeout.as_millis())))]
-    pub async fn acquire_timeout(
-        &self,
-        key: &str,
-        timeout: Duration,
-    ) -> Result<RateLimitDecision> {
+    pub async fn acquire_timeout(&self, key: &str, timeout: Duration) -> Result<RateLimitDecision> {
         let start = tokio::time::Instant::now();
 
         loop {
@@ -513,7 +509,10 @@ impl RateLimiter {
             let sleep_time = decision.retry_after.unwrap_or(Duration::from_millis(10));
 
             #[cfg(feature = "observability")]
-            debug!(sleep_ms = sleep_time.as_millis(), "Waiting for tokens to refill");
+            debug!(
+                sleep_ms = sleep_time.as_millis(),
+                "Waiting for tokens to refill"
+            );
 
             tokio::time::sleep(sleep_time).await;
         }
