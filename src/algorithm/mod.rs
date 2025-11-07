@@ -7,8 +7,18 @@ use async_trait::async_trait;
 mod leaky_bucket;
 mod token_bucket;
 
+// v0.6.0 experimental optimizations
+mod cached_token_bucket;
+mod simd_token_bucket;
+mod zerocopy_token_bucket;
+
 pub use leaky_bucket::LeakyBucket;
 pub use token_bucket::TokenBucket;
+
+// Experimental exports (v0.6.0)
+pub use cached_token_bucket::CachedTokenBucket;
+pub use simd_token_bucket::SimdTokenBucket;
+pub use zerocopy_token_bucket::ZeroCopyTokenBucket;
 
 /// Private module for the sealed trait pattern.
 ///
@@ -33,12 +43,18 @@ mod private {
 ///
 /// # Available Algorithms
 ///
-/// - [`TokenBucket`] - Allows bursts up to capacity, refills at constant rate
-/// - [`LeakyBucket`] - Enforces steady rate, smooths traffic (NEW in v0.3.0)
+/// - [`TokenBucket`] - Allows bursts up to capacity, refills at constant rate (zero-copy optimized in v0.4.0)
+/// - [`LeakyBucket`] - Enforces steady rate, smooths traffic (v0.3.0)
+/// - [`CachedTokenBucket`] - Thread-local cached token bucket for hot-key workloads (v0.4.0)
 ///
-/// # Planned Algorithms
+/// # Experimental Algorithms (Not Recommended for Production)
 ///
-/// - Sliding Window (future) - More precise rate limiting
+/// - [`ZeroCopyTokenBucket`] - Zero-copy prototype (integrated into TokenBucket in v0.4.0)
+/// - [`SimdTokenBucket`] - SIMD prototype (deferred, no performance benefit)
+///
+/// # Future Algorithms
+///
+/// - Sliding Window - More precise rate limiting
 #[async_trait]
 pub trait Algorithm: Send + Sync + private::Sealed {
     /// Checks if a request for the given key should be permitted.

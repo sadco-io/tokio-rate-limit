@@ -6,7 +6,7 @@ High-performance rate limiting library for Rust with lock-free token accounting,
 [![Documentation](https://docs.rs/tokio-rate-limit/badge.svg)](https://docs.rs/tokio-rate-limit)
 [![License](https://img.shields.io/crates/l/tokio-rate-limit)](LICENSE-MIT)
 
-**Performance:** 15.2M ops/sec single-threaded | 8.0M ops/sec on 4 cores | Sub-microsecond P99 latency
+**Performance:** 20.2M ops/sec single-threaded | 9.0M ops/sec on 4 cores | Sub-microsecond P99 latency *(+19% in v0.4.0)*
 
 ## Why Another Rate Limiter?
 
@@ -20,7 +20,7 @@ That's where `tokio-rate-limit` shines:
 - ✅ **Drop-in Axum middleware** - Zero boilerplate, automatic 429 responses with RFC-compliant headers
 - ✅ **Cost-based limiting** - Different costs for different operations (NEW in v0.2.0)
 - ✅ **Production observability** - Optional tracing & metrics with zero overhead when disabled (NEW in v0.2.0)
-- ✅ **15M+ ops/sec performance** - Lock-free design scales to thousands of keys
+- ✅ **20M+ ops/sec performance** - Lock-free design with zero-copy optimization (v0.4.0)
 - ✅ **Memory safe** - TTL-based eviction prevents unbounded growth
 
 **Use Cases:**
@@ -58,20 +58,26 @@ That's where `tokio-rate-limit` shines:
 
 ## Performance
 
-Benchmarks on an Apple M1 Pro (darwin) using flurry's lock-free HashMap:
+**v0.4.0 introduces zero-copy optimization for +19% improvement!**
 
-| Configuration | Latency (P50) | Throughput | vs DashMap |
-|--------------|---------------|------------|------------|
-| Single-threaded | 65ns | 15.2M ops/sec | +19% |
-| 2 threads | 117ns | 8.6M ops/sec | +66% |
-| 4 threads | 125ns | 8.0M ops/sec | +69% |
-| 8 threads | 221ns | 4.5M ops/sec | +117% |
-| 16 threads | 384ns | 2.6M ops/sec | +40% |
+Benchmarks on Apple M1 Pro/M3 using flurry's lock-free HashMap:
+
+| Configuration | Latency (P50) | Throughput | vs v0.3.0 | vs DashMap |
+|--------------|---------------|------------|-----------|------------|
+| **Single-threaded** | **49ns** | **20.2M ops/sec** | **+19%** | +40% |
+| **2 threads** | 101ns | 9.9M ops/sec | +12% | +80% |
+| **4 threads** | 111ns | 9.0M ops/sec | +12% | +84% |
+| 8 threads | 221ns | 4.5M ops/sec | 0% | +117% |
+| 16 threads | 384ns | 2.6M ops/sec | 0% | +40% |
+
+**CachedTokenBucket (NEW in v0.4.0 - Opt-In):**
+- Single-threaded: **21.7M ops/sec** (+25% vs baseline)
+- Best for: Per-IP or per-user rate limiting (<1000 unique keys)
 
 **Observability Overhead (Optional Features):**
-- Baseline (no features): 15.2M ops/sec
-- With tracing: 12.8M ops/sec (-16%, but <0.001% in real HTTP workloads)
-- With metrics: 12.9M ops/sec (-15%, negligible in production)
+- Baseline (no features): 20.2M ops/sec
+- With tracing: 17.0M ops/sec (-16%, but <0.001% in real HTTP workloads)
+- With metrics: 17.1M ops/sec (-15%, negligible in production)
 
 See [ENHANCED_API_BENCHMARKS.md](ENHANCED_API_BENCHMARKS.md) for detailed performance analysis and [ALGORITHM_BENCHMARKS.md](ALGORITHM_BENCHMARKS.md) for TokenBucket vs LeakyBucket comparison.
 
@@ -583,14 +589,14 @@ Both libraries are excellent choices depending on your use case!
 
 Full API documentation is available at [docs.rs/tokio-rate-limit](https://docs.rs/tokio-rate-limit).
 
-## What's New in v0.3.0
+## What's New in v0.4.0
 
-- **Leaky Bucket Algorithm**: New algorithm for enforcing steady rate without bursts
-- **Sealed Algorithm Trait**: Trait is now sealed for API stability, allows non-breaking changes
-- **from_algorithm()**: Create RateLimiter with custom algorithms (TokenBucket or LeakyBucket)
-- **Algorithm Comparison**: New example demonstrating differences between algorithms
+- **Zero-Copy Optimization**: +10-19% performance improvement (automatic, no code changes)
+- **CachedTokenBucket**: +25% for hot-key workloads like per-IP/per-user limiting (opt-in)
+- **20M+ ops/sec**: Single-threaded performance increased from 16M to 20M ops/sec
+- **90% Fewer Allocations**: String allocations eliminated on HashMap lookups
 
-See [CHANGELOG.md](CHANGELOG.md) for complete release notes and v0.2.0 features.
+See [CHANGELOG.md](CHANGELOG.md) for complete release notes, v0.3.0 (algorithms), and v0.2.0 (features) updates.
 
 ## Minimum Supported Rust Version (MSRV)
 

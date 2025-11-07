@@ -430,17 +430,17 @@ impl Algorithm for TokenBucket {
         }
 
         // Get or create token state for this key
-        // flurry requires a guard for each operation
+        // Zero-copy optimization: Use borrowed key for lookup, only allocate on insert
         let guard = self.tokens.guard();
-        let key_string = key.to_string();
-        let state = match self.tokens.get(&key_string, &guard) {
+        let state = match self.tokens.get(key, &guard) {
             Some(state) => state.clone(),
             None => {
-                // Insert new state and return it
+                // Insert new state - only allocates here when creating new key
                 let new_state = Arc::new(AtomicTokenState::new(self.capacity, now));
+                let key_string = key.to_string(); // Allocate only when inserting
                 match self
                     .tokens
-                    .try_insert(key_string.clone(), new_state.clone(), &guard)
+                    .try_insert(key_string, new_state.clone(), &guard)
                 {
                     Ok(_) => new_state,
                     Err(current) => current.current.clone(), // Another thread inserted, use their value
@@ -501,16 +501,17 @@ impl Algorithm for TokenBucket {
         }
 
         // Get or create token state for this key
+        // Zero-copy optimization: Use borrowed key for lookup, only allocate on insert
         let guard = self.tokens.guard();
-        let key_string = key.to_string();
-        let state = match self.tokens.get(&key_string, &guard) {
+        let state = match self.tokens.get(key, &guard) {
             Some(state) => state.clone(),
             None => {
-                // Insert new state and return it
+                // Insert new state - only allocates here when creating new key
                 let new_state = Arc::new(AtomicTokenState::new(self.capacity, now));
+                let key_string = key.to_string(); // Allocate only when inserting
                 match self
                     .tokens
-                    .try_insert(key_string.clone(), new_state.clone(), &guard)
+                    .try_insert(key_string, new_state.clone(), &guard)
                 {
                     Ok(_) => new_state,
                     Err(current) => current.current.clone(), // Another thread inserted, use their value

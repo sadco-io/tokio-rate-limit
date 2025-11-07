@@ -1,6 +1,6 @@
 [package]
 name = "tokio-rate-limit"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.75.0"
 authors = ["Daniel Curtis <drc@danielryancurtis.com>"]
@@ -93,6 +93,10 @@ harness = false
 
 [[bench]]
 name = "algorithm_comparison"
+harness = false
+
+[[bench]]
+name = "v0_6_optimizations"
 harness = false
 
 [profile.release]
