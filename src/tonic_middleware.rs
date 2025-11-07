@@ -32,7 +32,7 @@
 use crate::{RateLimitDecision, RateLimiter};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tonic::body::BoxBody;
+use tonic::body::Body;
 use tonic::{Code, Status};
 use tower::{Layer, Service};
 
@@ -50,7 +50,7 @@ pub trait GrpcKeyExtractor: Send + Sync + 'static {
     /// # Returns
     ///
     /// A string key to use for rate limiting, or None if the request should not be rate limited.
-    fn extract(&self, req: &http::Request<BoxBody>) -> Option<String>;
+    fn extract(&self, req: &http::Request<Body>) -> Option<String>;
 }
 
 /// Default key extractor that uses the gRPC method path.
@@ -66,7 +66,7 @@ pub trait GrpcKeyExtractor: Send + Sync + 'static {
 pub struct MethodKeyExtractor;
 
 impl GrpcKeyExtractor for MethodKeyExtractor {
-    fn extract(&self, req: &http::Request<BoxBody>) -> Option<String> {
+    fn extract(&self, req: &http::Request<Body>) -> Option<String> {
         // Extract the gRPC method path from the URI
         // Format: /{package}.{service}/{method}
         let path = req.uri().path();
@@ -85,7 +85,7 @@ impl GrpcKeyExtractor for MethodKeyExtractor {
 pub struct IpKeyExtractor;
 
 impl GrpcKeyExtractor for IpKeyExtractor {
-    fn extract(&self, req: &http::Request<BoxBody>) -> Option<String> {
+    fn extract(&self, req: &http::Request<Body>) -> Option<String> {
         // In a real implementation, you'd extract this from connection info
         // For now, we check headers that might contain the client IP
         req.headers()
@@ -133,7 +133,7 @@ impl MetadataKeyExtractor {
 }
 
 impl GrpcKeyExtractor for MetadataKeyExtractor {
-    fn extract(&self, req: &http::Request<BoxBody>) -> Option<String> {
+    fn extract(&self, req: &http::Request<Body>) -> Option<String> {
         req.headers()
             .get(&self.header_name)
             .and_then(|v| v.to_str().ok())
@@ -160,14 +160,14 @@ impl GrpcKeyExtractor for MetadataKeyExtractor {
 #[derive(Clone)]
 pub struct CustomGrpcKeyExtractor<F>
 where
-    F: Fn(&http::Request<BoxBody>) -> Option<String> + Send + Sync + Clone + 'static,
+    F: Fn(&http::Request<Body>) -> Option<String> + Send + Sync + Clone + 'static,
 {
     extractor: F,
 }
 
 impl<F> CustomGrpcKeyExtractor<F>
 where
-    F: Fn(&http::Request<BoxBody>) -> Option<String> + Send + Sync + Clone + 'static,
+    F: Fn(&http::Request<Body>) -> Option<String> + Send + Sync + Clone + 'static,
 {
     /// Creates a new custom key extractor with the given function.
     pub fn new(extractor: F) -> Self {
@@ -177,9 +177,9 @@ where
 
 impl<F> GrpcKeyExtractor for CustomGrpcKeyExtractor<F>
 where
-    F: Fn(&http::Request<BoxBody>) -> Option<String> + Send + Sync + Clone + 'static,
+    F: Fn(&http::Request<Body>) -> Option<String> + Send + Sync + Clone + 'static,
 {
-    fn extract(&self, req: &http::Request<BoxBody>) -> Option<String> {
+    fn extract(&self, req: &http::Request<Body>) -> Option<String> {
         (self.extractor)(req)
     }
 }
@@ -265,14 +265,14 @@ where
     extractor: E,
 }
 
-impl<S, E> Service<http::Request<BoxBody>> for GrpcRateLimitService<S, E>
+impl<S, E> Service<http::Request<Body>> for GrpcRateLimitService<S, E>
 where
-    S: Service<http::Request<BoxBody>, Response = http::Response<BoxBody>> + Clone + Send + 'static,
+    S: Service<http::Request<Body>, Response = http::Response<Body>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
     E: GrpcKeyExtractor + Clone,
 {
-    type Response = http::Response<BoxBody>;
+    type Response = http::Response<Body>;
     type Error = Box<dyn std::error::Error + Send + Sync>;
     type Future = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
@@ -282,7 +282,7 @@ where
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
-    fn call(&mut self, req: http::Request<BoxBody>) -> Self::Future {
+    fn call(&mut self, req: http::Request<Body>) -> Self::Future {
         let limiter = self.limiter.clone();
         let extractor = self.extractor.clone();
         let mut inner = self.inner.clone();
@@ -341,9 +341,9 @@ where
 /// gRPC uses HTTP/2 trailers to send metadata after the response body.
 /// This function adds rate limit information that clients can inspect.
 fn add_rate_limit_trailer(
-    mut response: http::Response<BoxBody>,
+    mut response: http::Response<Body>,
     decision: &RateLimitDecision,
-) -> http::Response<BoxBody> {
+) -> http::Response<Body> {
     let headers = response.headers_mut();
 
     // Add rate limit information as headers (will become trailers in gRPC)
@@ -379,7 +379,7 @@ fn add_rate_limit_trailer(
 /// - Status: RESOURCE_EXHAUSTED
 /// - Message: "Rate limit exceeded"
 /// - Metadata: Rate limit information (limit, remaining, retry-after)
-fn rate_limit_error_response(decision: &RateLimitDecision) -> http::Response<BoxBody> {
+fn rate_limit_error_response(decision: &RateLimitDecision) -> http::Response<Body> {
     let mut status = Status::resource_exhausted("Rate limit exceeded");
 
     // Add rate limit metadata to the status
@@ -414,58 +414,14 @@ fn rate_limit_error_response(decision: &RateLimitDecision) -> http::Response<Box
 ///
 /// This is used internally by the error response generation.
 trait StatusExt {
-    fn to_http(self) -> http::Response<BoxBody>;
+    fn to_http(self) -> http::Response<Body>;
 }
 
 impl StatusExt for Status {
-    fn to_http(self) -> http::Response<BoxBody> {
-        let mut response = http::Response::new(BoxBody::default());
-        *response.status_mut() = self.code().to_http_status();
-
-        // Add gRPC status headers
-        response.headers_mut().insert(
-            "grpc-status",
-            (self.code() as i32).to_string().parse().unwrap(),
-        );
-
-        if let Ok(value) = self.message().parse() {
-            response.headers_mut().insert("grpc-message", value);
-        }
-
-        // Copy metadata to response headers
-        // Note: tonic metadata uses a different type system than http headers
-        // We need to convert them appropriately
-        for key_and_value in self.metadata().iter() {
-            match key_and_value {
-                tonic::metadata::KeyAndValueRef::Ascii(key, value) => {
-                    let Ok(header_name) = http::header::HeaderName::from_bytes(key.as_ref()) else {
-                        continue;
-                    };
-                    let Ok(header_value) = http::header::HeaderValue::from_bytes(value.as_ref())
-                    else {
-                        continue;
-                    };
-                    let entry = response.headers_mut().entry(header_name);
-                    if let http::header::Entry::Vacant(e) = entry {
-                        e.insert(header_value);
-                    }
-                }
-                tonic::metadata::KeyAndValueRef::Binary(key, value) => {
-                    let Ok(header_name) = http::header::HeaderName::from_bytes(key.as_ref()) else {
-                        continue;
-                    };
-                    let Ok(header_value) = http::header::HeaderValue::from_bytes(value.as_ref())
-                    else {
-                        continue;
-                    };
-                    let entry = response.headers_mut().entry(header_name);
-                    if let http::header::Entry::Vacant(e) = entry {
-                        e.insert(header_value);
-                    }
-                }
-            }
-        }
-
+    fn to_http(self) -> http::Response<Body> {
+        let code = self.code();
+        let mut response = self.into_http::<Body>();
+        *response.status_mut() = code.to_http_status();
         response
     }
 }
@@ -510,7 +466,7 @@ mod tests {
         let extractor = MethodKeyExtractor;
         let req = http::Request::builder()
             .uri("http://example.com/helloworld.Greeter/SayHello")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let key = extractor.extract(&req);
@@ -522,7 +478,7 @@ mod tests {
         let extractor = MethodKeyExtractor;
         let req = http::Request::builder()
             .uri("http://example.com/test.Service/Method")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let key = extractor.extract(&req);
@@ -535,7 +491,7 @@ mod tests {
         let req = http::Request::builder()
             .uri("http://example.com/test")
             .header("user-id", "user-123")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let key = extractor.extract(&req);
@@ -547,7 +503,7 @@ mod tests {
         let extractor = MetadataKeyExtractor::new("user-id");
         let req = http::Request::builder()
             .uri("http://example.com/test")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let key = extractor.extract(&req);
@@ -560,7 +516,7 @@ mod tests {
         let req = http::Request::builder()
             .uri("http://example.com/test")
             .header("x-forwarded-for", "192.168.1.1, 10.0.0.1")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let key = extractor.extract(&req);
@@ -573,7 +529,7 @@ mod tests {
         let req = http::Request::builder()
             .uri("http://example.com/test")
             .header("x-forwarded-for", "192.168.1.1")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let key = extractor.extract(&req);
@@ -586,7 +542,7 @@ mod tests {
         let req = http::Request::builder()
             .uri("http://example.com/test")
             .header("x-real-ip", "10.0.0.1")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let key = extractor.extract(&req);
@@ -598,7 +554,7 @@ mod tests {
         let extractor = IpKeyExtractor;
         let req = http::Request::builder()
             .uri("http://example.com/test")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let key = extractor.extract(&req);
@@ -614,7 +570,7 @@ mod tests {
 
         let req = http::Request::builder()
             .uri("http://example.com/test.Service/Method")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let key = extractor.extract(&req);
@@ -627,7 +583,7 @@ mod tests {
 
         let req = http::Request::builder()
             .uri("http://example.com/test")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let key = extractor.extract(&req);
@@ -711,7 +667,7 @@ mod tests {
             retry_after: None,
         };
 
-        let response = http::Response::new(BoxBody::default());
+        let response = http::Response::new(Body::default());
         let response = add_rate_limit_trailer(response, &decision);
 
         assert_eq!(
@@ -747,8 +703,8 @@ mod tests {
         }
     }
 
-    impl Service<http::Request<BoxBody>> for MockService {
-        type Response = http::Response<BoxBody>;
+    impl Service<http::Request<Body>> for MockService {
+        type Response = http::Response<Body>;
         type Error = Box<dyn std::error::Error + Send + Sync>;
         type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -756,8 +712,8 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn call(&mut self, _req: http::Request<BoxBody>) -> Self::Future {
-            Box::pin(async move { Ok(http::Response::new(BoxBody::default())) })
+        fn call(&mut self, _req: http::Request<Body>) -> Self::Future {
+            Box::pin(async move { Ok(http::Response::new(Body::default())) })
         }
     }
 
@@ -776,7 +732,7 @@ mod tests {
 
         let req = http::Request::builder()
             .uri("http://example.com/test.Service/Method")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = service.call(req).await.unwrap();
@@ -804,7 +760,7 @@ mod tests {
         // First request should succeed
         let req = http::Request::builder()
             .uri("http://example.com/test.Service/Method")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = service.call(req).await.unwrap();
@@ -813,7 +769,7 @@ mod tests {
         // Second immediate request should be rate limited
         let req = http::Request::builder()
             .uri("http://example.com/test.Service/Method")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = service.call(req).await.unwrap();
@@ -841,7 +797,7 @@ mod tests {
 
         let req = http::Request::builder()
             .uri("http://example.com/test")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         // Should allow request when no key is extracted
@@ -873,7 +829,7 @@ mod tests {
         let req = http::Request::builder()
             .uri("http://example.com/test.Service/Method")
             .header("user-id", "user-1")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = service.call(req).await.unwrap();
@@ -883,7 +839,7 @@ mod tests {
         let req = http::Request::builder()
             .uri("http://example.com/test.Service/Method")
             .header("user-id", "user-1")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = service.call(req).await.unwrap();
@@ -893,7 +849,7 @@ mod tests {
         let req = http::Request::builder()
             .uri("http://example.com/test.Service/Method")
             .header("user-id", "user-2")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = service.call(req).await.unwrap();
@@ -916,7 +872,7 @@ mod tests {
         // Request to Method1
         let req = http::Request::builder()
             .uri("http://example.com/test.Service/Method1")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = service.call(req).await.unwrap();
@@ -925,7 +881,7 @@ mod tests {
         // Second request to Method1 should be rate limited
         let req = http::Request::builder()
             .uri("http://example.com/test.Service/Method1")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = service.call(req).await.unwrap();
@@ -934,7 +890,7 @@ mod tests {
         // Request to Method2 should be allowed (different key)
         let req = http::Request::builder()
             .uri("http://example.com/test.Service/Method2")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = service.call(req).await.unwrap();

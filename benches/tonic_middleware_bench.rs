@@ -5,15 +5,18 @@
 
 #![cfg(feature = "tonic-support")]
 
+use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use http_body_util::combinators::UnsyncBoxBody;
 use std::sync::Arc;
 use tokio_rate_limit::tonic_middleware::{
     CustomGrpcKeyExtractor, GrpcKeyExtractor, GrpcRateLimitLayer, IpKeyExtractor,
     MetadataKeyExtractor, MethodKeyExtractor,
 };
 use tokio_rate_limit::RateLimiter;
-use tonic::body::BoxBody;
 use tower::{Layer, Service, ServiceExt};
+
+type BoxBody = UnsyncBoxBody<Bytes, tonic::Status>;
 
 // Mock gRPC service for benchmarking
 #[derive(Clone)]

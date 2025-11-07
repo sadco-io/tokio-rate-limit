@@ -1,13 +1,94 @@
 # Future Plans for tokio-rate-limit
 
-**Last Updated:** 2025-01-06
-**Current Version:** v0.4.0
+**Last Updated:** 2025-01-07
+**Current Version:** v0.5.0
 
 This document outlines high-impact features and improvements for future releases.
 
 ---
 
-## 🎯 Top Priority (Ship Next)
+## 🚀 Performance Optimizations (v0.6.0 - Top Priority)
+
+### Deferred Locking (Read-Optimized Fast Path) ⭐⭐⭐
+**Status:** Designed, Ready to Implement
+**Effort:** Low (1-2 days)
+**Impact:** Very High (2-3x throughput)
+**Priority:** P0
+
+**Why:** Most requests don't need token refill - optimize the hot path
+
+**Current Bottleneck:**
+- 2 CAS operations per request (tokens + time update)
+- Always updates last_refill, even when not needed
+
+**Optimization:**
+```rust
+// FAST PATH (90% of requests): Single CAS, no time update
+if tokens >= cost {
+    return tokens.compare_exchange(...); // ✅ 1 CAS
+}
+
+// SLOW PATH (10%): Need refill (existing complex logic)
+self.refill_and_consume()
+```
+
+**Expected Impact:**
+- Single-threaded: 18.5M → 25M+ ops/sec (+35%)
+- 8 threads: 4.9M → 12M+ ops/sec (+145%)
+
+---
+
+### Micro-Sharding (256 Shards) ⭐⭐
+**Status:** Designed, Benchmarks Exist
+**Effort:** Medium (1 week)
+**Impact:** Very High (4-8x multi-threaded)
+**Priority:** P1
+
+**Why:** Single HashMap is bottleneck for multi-threaded scale-up
+
+**Current Bottleneck:**
+- All threads contend on single HashMap guard
+- 10,000 keys in one structure
+
+**Optimization:**
+```rust
+const SHARDS: usize = 256;
+let shard_id = hash(key) & (SHARDS - 1); // Fast modulo
+shards[shard_id].get(key) // 256x less contention
+```
+
+**Expected Impact:**
+- 2 threads: 9.5M → 35M+ ops/sec (+268%)
+- 8 threads: 4.9M → 100M+ ops/sec (+1,940%)
+
+---
+
+### Probabilistic Rate Limiting (Optional Algorithm) ⭐
+**Status:** Prototype Ready
+**Effort:** Medium (1 week)
+**Impact:** Extreme (50-100x for specific use cases)
+**Priority:** P2
+
+**Why:** For ultra-high throughput where approximation is acceptable
+
+**Approach:**
+```rust
+// Sample 1% of requests, scale result
+if rand() % 100 == 0 {
+    counter.fetch_add(100, Relaxed); // Only 1% do atomic op
+}
+return counter.load() < limit * 100;
+```
+
+**Expected Impact:**
+- Single-threaded: 18.5M → 500M+ ops/sec (+2,600%)
+- Near-linear multi-threaded scaling
+
+**Trade-off:** ~1-2% error margin (acceptable for rate limiting)
+
+---
+
+## 🎯 Standard Features (Ship Next)
 
 ### 1. GitHub Actions CI/CD ⭐ (CRITICAL)
 **Status:** Not Started

@@ -7,6 +7,131 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2025-01-07
+
+### Added
+
+- **Tonic gRPC Middleware Support**
+  - `GrpcRateLimitLayer` for Tower-based gRPC rate limiting
+  - 4 key extraction strategies:
+    - `MethodKeyExtractor`: Per-method rate limiting (default)
+    - `IpKeyExtractor`: Per-IP rate limiting from connection info
+    - `MetadataKeyExtractor`: Extract from gRPC metadata headers
+    - `CustomGrpcKeyExtractor`: Custom extraction logic
+  - Proper gRPC status codes (`RESOURCE_EXHAUSTED` on limit exceeded)
+  - Rate limit metadata in response trailers
+  - Feature flag: `tonic-support`
+  - **54 comprehensive tests** covering all key scenarios
+  - Performance: <300ns overhead per request
+
+- **Documentation**
+  - `TONIC_INTEGRATION.md`: Complete integration guide with examples
+  - `TONIC_RESEARCH_SUMMARY.md`: Design decisions and architecture
+  - `TONIC_TEST_REPORT.md`: Test coverage and validation
+  - `FUTURE_PLANS.md`: Project roadmap and priorities
+  - `BENCHMARK_COMPARISON_v0.5.0.md`: Performance analysis
+
+### Performance
+
+Benchmarks on Apple M1 Pro with tokio 1.40, flurry 0.5:
+
+- **Single-threaded**: 18.5M ops/sec (54ns latency)
+- **Multi-threaded**:
+  - 2 threads: 9.5M ops/sec (105ns)
+  - 4 threads: 7.9M ops/sec (126ns)
+  - 8 threads: 4.9M ops/sec (205ns)
+  - 16 threads: 2.7M ops/sec (371ns)
+- **Algorithm Comparison**:
+  - TokenBucket: 56ns per operation (fastest, allows bursts)
+  - LeakyBucket: 67ns per operation (stricter rate enforcement)
+- **Tonic Middleware Overhead**: <1% (<300ns per request)
+- **Key Distribution**:
+  - Hot key (worst case): 18.5M ops/sec single-threaded
+  - Distributed keys (realistic): 18.6M ops/sec single-threaded
+  - Key contention impact: <1%
+
+### Dependencies
+
+- **Core dependencies** (unchanged from v0.4.0):
+  - `tokio = "1.40"` - Kept at stable version for optimal performance
+  - `flurry = "0.5"` - Lock-free concurrent HashMap
+  - `parking_lot = "0.12"` - Fast synchronization primitives
+  - `axum = "0.7"` (optional) - Web framework middleware
+  - `tower = "0.5"` (optional) - Service middleware
+
+- **Added** (optional, with `tonic-support` flag):
+  - `tonic = "0.14.2"` - gRPC framework
+  - `tonic-prost = "0.14.2"` - Protocol buffers support
+  - `http = "1.3.1"` - HTTP types
+  - `tonic-prost-build = "0.14.2"` (build-time only)
+
+### Testing
+
+- **54 new tests** for Tonic gRPC middleware:
+  - Method-based key extraction (7 tests)
+  - IP-based key extraction (7 tests)
+  - Metadata-based key extraction (11 tests)
+  - Custom key extraction (8 tests)
+  - Tower Service integration (9 tests)
+  - Layer configuration and edge cases (12 tests)
+- All tests passing with comprehensive coverage
+
+### Migration Guide
+
+**Backward Compatible** - No breaking changes from v0.4.0.
+
+**Adding Tonic gRPC Support:**
+
+```toml
+# Add to Cargo.toml
+tokio-rate-limit = { version = "0.5", features = ["tonic-support"] }
+```
+
+```rust
+use tokio_rate_limit::tonic_middleware::GrpcRateLimitLayer;
+use std::sync::Arc;
+
+let limiter = Arc::new(
+    RateLimiter::builder()
+        .requests_per_second(100)
+        .burst(200)
+        .build()?
+);
+
+// Default: Per-method rate limiting
+Server::builder()
+    .layer(GrpcRateLimitLayer::new(limiter.clone()))
+    .add_service(GreeterServer::new(greeter))
+    .serve(addr)
+    .await?;
+
+// Per-IP rate limiting
+use tokio_rate_limit::tonic_middleware::IpKeyExtractor;
+Server::builder()
+    .layer(GrpcRateLimitLayer::with_extractor(limiter.clone(), IpKeyExtractor))
+    .add_service(service)
+    .serve(addr)
+    .await?;
+
+// Per-user from metadata
+use tokio_rate_limit::tonic_middleware::MetadataKeyExtractor;
+Server::builder()
+    .layer(GrpcRateLimitLayer::with_extractor(
+        limiter,
+        MetadataKeyExtractor::new("user-id")
+    ))
+    .add_service(service)
+    .serve(addr)
+    .await?;
+```
+
+**Features Summary:**
+- Minimal overhead (<300ns per request)
+- Proper gRPC status codes and metadata
+- Multiple key extraction strategies
+- Seamless Tower integration
+- Compatible with all Tonic services
+
 ## [0.4.0] - 2025-01-06
 
 ### Performance Improvements

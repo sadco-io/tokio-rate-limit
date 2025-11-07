@@ -12,7 +12,7 @@ use tokio_rate_limit::tonic_middleware::{
     CustomGrpcKeyExtractor, GrpcRateLimitLayer, IpKeyExtractor, MetadataKeyExtractor,
 };
 use tokio_rate_limit::RateLimiter;
-use tonic::body::BoxBody;
+use tonic::body::Body;
 use tonic::Code;
 use tower::{Layer, Service, ServiceExt};
 
@@ -20,8 +20,8 @@ use tower::{Layer, Service, ServiceExt};
 #[derive(Clone)]
 struct TestService;
 
-impl tower::Service<http::Request<BoxBody>> for TestService {
-    type Response = http::Response<BoxBody>;
+impl tower::Service<http::Request<Body>> for TestService {
+    type Response = http::Response<Body>;
     type Error = Box<dyn std::error::Error + Send + Sync>;
     type Future = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
@@ -34,11 +34,11 @@ impl tower::Service<http::Request<BoxBody>> for TestService {
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, _req: http::Request<BoxBody>) -> Self::Future {
+    fn call(&mut self, _req: http::Request<Body>) -> Self::Future {
         Box::pin(async move {
             let response = http::Response::builder()
                 .status(200)
-                .body(BoxBody::default())
+                .body(Body::default())
                 .unwrap();
             Ok(response)
         })
@@ -62,7 +62,7 @@ async fn test_basic_rate_limiting() {
     for i in 1..=2 {
         let request = http::Request::builder()
             .uri("http://localhost/test.Service/Method")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -72,7 +72,7 @@ async fn test_basic_rate_limiting() {
     // Third immediate request should be rate limited
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -105,7 +105,7 @@ async fn test_rate_limit_recovery() {
     for _ in 0..10 {
         let request = http::Request::builder()
             .uri("http://localhost/test.Service/Method")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -115,7 +115,7 @@ async fn test_rate_limit_recovery() {
     // 11th immediate request should be rate limited
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -127,7 +127,7 @@ async fn test_rate_limit_recovery() {
     // Request should succeed after waiting
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -150,7 +150,7 @@ async fn test_per_method_rate_limiting() {
     // Request to Method1 succeeds
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method1")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -159,7 +159,7 @@ async fn test_per_method_rate_limiting() {
     // Second request to Method1 is rate limited
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method1")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -168,7 +168,7 @@ async fn test_per_method_rate_limiting() {
     // Request to Method2 succeeds (different rate limit bucket)
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method2")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -177,7 +177,7 @@ async fn test_per_method_rate_limiting() {
     // Second request to Method2 is also rate limited
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method2")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -201,7 +201,7 @@ async fn test_ip_based_rate_limiting() {
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method")
         .header("x-forwarded-for", "192.168.1.1")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -211,7 +211,7 @@ async fn test_ip_based_rate_limiting() {
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method")
         .header("x-forwarded-for", "192.168.1.1")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -221,7 +221,7 @@ async fn test_ip_based_rate_limiting() {
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method")
         .header("x-forwarded-for", "192.168.1.2")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -246,7 +246,7 @@ async fn test_metadata_based_rate_limiting() {
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method")
         .header("x-user-id", "user-123")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -256,7 +256,7 @@ async fn test_metadata_based_rate_limiting() {
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method")
         .header("x-user-id", "user-123")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -266,7 +266,7 @@ async fn test_metadata_based_rate_limiting() {
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method")
         .header("x-user-id", "user-456")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -296,7 +296,7 @@ async fn test_custom_extractor_combining_method_and_user() {
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method1")
         .header("x-user-id", "user-1")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -306,7 +306,7 @@ async fn test_custom_extractor_combining_method_and_user() {
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method1")
         .header("x-user-id", "user-1")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -316,7 +316,7 @@ async fn test_custom_extractor_combining_method_and_user() {
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method1")
         .header("x-user-id", "user-2")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -326,7 +326,7 @@ async fn test_custom_extractor_combining_method_and_user() {
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method2")
         .header("x-user-id", "user-1")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -353,7 +353,7 @@ async fn test_concurrent_requests_different_keys() {
         let handle = tokio::spawn(async move {
             let request = http::Request::builder()
                 .uri(format!("http://localhost/test.Service/Method{}", i))
-                .body(BoxBody::default())
+                .body(Body::default())
                 .unwrap();
 
             service.ready().await.unwrap().call(request).await
@@ -388,7 +388,7 @@ async fn test_concurrent_requests_same_key() {
         let handle = tokio::spawn(async move {
             let request = http::Request::builder()
                 .uri("http://localhost/test.Service/Method")
-                .body(BoxBody::default())
+                .body(Body::default())
                 .unwrap();
 
             service.ready().await.unwrap().call(request).await
@@ -437,7 +437,7 @@ async fn test_rate_limit_headers_in_response() {
 
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -482,7 +482,7 @@ async fn test_rate_limit_error_headers() {
     // First request succeeds
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     service.ready().await.unwrap().call(request).await.unwrap();
@@ -490,7 +490,7 @@ async fn test_rate_limit_error_headers() {
     // Second request is rate limited
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method")
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -537,7 +537,7 @@ async fn test_no_rate_limit_when_key_not_extracted() {
     for _ in 0..10 {
         let request = http::Request::builder()
             .uri("http://localhost/test.Service/Method")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = service.ready().await.unwrap().call(request).await.unwrap();
@@ -565,7 +565,7 @@ async fn test_high_throughput() {
         let handle = tokio::spawn(async move {
             let request = http::Request::builder()
                 .uri(format!("http://localhost/test.Service/Method{}", i % 10))
-                .body(BoxBody::default())
+                .body(Body::default())
                 .unwrap();
 
             service.ready().await.unwrap().call(request).await
