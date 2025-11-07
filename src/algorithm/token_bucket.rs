@@ -22,6 +22,11 @@ const MAX_BURST: u64 = u64::MAX / (2 * SCALE);
 /// Same bound as MAX_BURST for consistency.
 const MAX_RATE_PER_SEC: u64 = u64::MAX / (2 * SCALE);
 
+/// Number of shards for the token bucket HashMap.
+/// 256 shards (power of 2) allows fast modulo via bit masking and reduces
+/// contention by 256x compared to a single HashMap.
+const NUM_SHARDS: usize = 256;
+
 /// Atomic state for a token bucket.
 ///
 /// This structure uses lock-free atomic operations to track the token count and last refill time.
@@ -222,14 +227,36 @@ pub struct TokenBucket {
     /// will be removed on the next cleanup pass. Set to None to disable eviction.
     idle_ttl: Option<Duration>,
 
-    /// Per-key token state stored in a concurrent hashmap.
-    /// flurry uses lock-free operations for concurrent access with automatic
-    /// internal optimization, providing excellent concurrency while maintaining
-    /// per-key isolation. Values are wrapped in Arc for efficient reference counting.
-    tokens: Arc<FlurryHashMap<String, Arc<AtomicTokenState>>>,
+    /// Sharded per-key token state (256 shards for reduced contention).
+    /// Each shard is an independent FlurryHashMap, reducing lock contention by 256x.
+    /// Keys are distributed across shards using a fast hash function with bit masking.
+    /// Values are wrapped in Arc for efficient reference counting.
+    shards: Vec<Arc<FlurryHashMap<String, Arc<AtomicTokenState>>>>,
 }
 
 impl TokenBucket {
+    /// Gets the shard index for a given key using a fast hash function.
+    /// Uses bit masking for fast modulo (NUM_SHARDS is power of 2).
+    #[inline]
+    fn get_shard_index(key: &str) -> usize {
+        // Use a simple but fast hash function
+        // FNV-1a hash is fast and has good distribution
+        let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+        for byte in key.bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3); // FNV prime
+        }
+        // Fast modulo using bit masking (NUM_SHARDS - 1)
+        (hash as usize) & (NUM_SHARDS - 1)
+    }
+
+    /// Gets the shard for a given key.
+    #[inline]
+    fn get_shard(&self, key: &str) -> &Arc<FlurryHashMap<String, Arc<AtomicTokenState>>> {
+        let index = Self::get_shard_index(key);
+        &self.shards[index]
+    }
+
     /// Creates a new token bucket with the specified capacity and refill rate.
     ///
     /// # Arguments
@@ -251,9 +278,9 @@ impl TokenBucket {
     ///
     /// # Performance
     ///
-    /// Uses flurry's lock-free HashMap with internal auto-tuning for optimal
-    /// performance across different workload sizes and thread counts. No manual
-    /// tuning is required.
+    /// Uses 256 sharded FlurryHashMaps for 256x reduced contention compared to a single HashMap.
+    /// Each shard uses lock-free operations for concurrent access with automatic internal
+    /// optimization. This architecture enables near-linear multi-threaded scaling.
     ///
     /// # Examples
     ///
@@ -268,12 +295,17 @@ impl TokenBucket {
         let safe_capacity = capacity.min(MAX_BURST);
         let safe_rate = refill_rate_per_second.min(MAX_RATE_PER_SEC);
 
+        // Create NUM_SHARDS independent HashMaps
+        let shards = (0..NUM_SHARDS)
+            .map(|_| Arc::new(FlurryHashMap::new()))
+            .collect();
+
         Self {
             capacity: safe_capacity,
             refill_rate_per_second: safe_rate,
             reference_instant: Instant::now(),
             idle_ttl: None,
-            tokens: Arc::new(FlurryHashMap::new()),
+            shards,
         }
     }
 
@@ -381,35 +413,44 @@ impl TokenBucket {
         self.reference_instant.elapsed().as_nanos() as u64
     }
 
+    /// Get the total number of keys across all shards.
+    /// Used primarily for testing and diagnostics.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.shards.iter().map(|shard| shard.len()).sum()
+    }
+
     /// Cleanup idle keys based on TTL configuration.
     ///
     /// This is called automatically on each check() to prevent unbounded growth.
-    /// Only runs if idle_ttl is configured.
+    /// Only runs if idle_ttl is configured. Iterates over all shards.
     fn cleanup_idle(&self, now_nanos: u64) {
         if let Some(ttl) = self.idle_ttl {
             let ttl_nanos = ttl.as_nanos() as u64;
 
-            // flurry doesn't have a retain() method, so we need to:
-            // 1. Iterate and collect keys to remove
-            // 2. Remove them in a separate pass
-            let guard = self.tokens.guard();
-            let keys_to_remove: Vec<String> = self
-                .tokens
-                .iter(&guard)
-                .filter_map(|(key, state)| {
-                    let last_access = state.last_access_nanos.load(Ordering::Relaxed);
-                    let age = now_nanos.saturating_sub(last_access);
-                    if age >= ttl_nanos {
-                        Some(key.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            // Iterate over all shards and clean up expired keys
+            for shard in &self.shards {
+                // flurry doesn't have a retain() method, so we need to:
+                // 1. Iterate and collect keys to remove
+                // 2. Remove them in a separate pass
+                let guard = shard.guard();
+                let keys_to_remove: Vec<String> = shard
+                    .iter(&guard)
+                    .filter_map(|(key, state)| {
+                        let last_access = state.last_access_nanos.load(Ordering::Relaxed);
+                        let age = now_nanos.saturating_sub(last_access);
+                        if age >= ttl_nanos {
+                            Some(key.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
 
-            // Remove expired keys
-            for key in keys_to_remove {
-                self.tokens.remove(&key, &guard);
+                // Remove expired keys from this shard
+                for key in keys_to_remove {
+                    shard.remove(&key, &guard);
+                }
             }
         }
     }
@@ -429,19 +470,19 @@ impl Algorithm for TokenBucket {
             self.cleanup_idle(now);
         }
 
+        // Get the appropriate shard for this key
+        let shard = self.get_shard(key);
+
         // Get or create token state for this key
         // Zero-copy optimization: Use borrowed key for lookup, only allocate on insert
-        let guard = self.tokens.guard();
-        let state = match self.tokens.get(key, &guard) {
+        let guard = shard.guard();
+        let state = match shard.get(key, &guard) {
             Some(state) => state.clone(),
             None => {
                 // Insert new state - only allocates here when creating new key
                 let new_state = Arc::new(AtomicTokenState::new(self.capacity, now));
                 let key_string = key.to_string(); // Allocate only when inserting
-                match self
-                    .tokens
-                    .try_insert(key_string, new_state.clone(), &guard)
-                {
+                match shard.try_insert(key_string, new_state.clone(), &guard) {
                     Ok(_) => new_state,
                     Err(current) => current.current.clone(), // Another thread inserted, use their value
                 }
@@ -500,19 +541,19 @@ impl Algorithm for TokenBucket {
             self.cleanup_idle(now);
         }
 
+        // Get the appropriate shard for this key
+        let shard = self.get_shard(key);
+
         // Get or create token state for this key
         // Zero-copy optimization: Use borrowed key for lookup, only allocate on insert
-        let guard = self.tokens.guard();
-        let state = match self.tokens.get(key, &guard) {
+        let guard = shard.guard();
+        let state = match shard.get(key, &guard) {
             Some(state) => state.clone(),
             None => {
                 // Insert new state - only allocates here when creating new key
                 let new_state = Arc::new(AtomicTokenState::new(self.capacity, now));
                 let key_string = key.to_string(); // Allocate only when inserting
-                match self
-                    .tokens
-                    .try_insert(key_string, new_state.clone(), &guard)
-                {
+                match shard.try_insert(key_string, new_state.clone(), &guard) {
                     Ok(_) => new_state,
                     Err(current) => current.current.clone(), // Another thread inserted, use their value
                 }
@@ -771,7 +812,7 @@ mod tests {
 
         // Access key1
         bucket.check("key1").await.unwrap();
-        assert_eq!(bucket.tokens.len(), 1);
+        assert_eq!(bucket.len(), 1);
 
         // Advance time by 2 seconds (past TTL)
         tokio::time::advance(Duration::from_secs(2)).await;
@@ -785,7 +826,7 @@ mod tests {
         // key1 should have been evicted (or will be soon)
         // Give it a moment to clean up
         // Actually, let's just verify the mechanism works by checking the count
-        let initial_count = bucket.tokens.len();
+        let initial_count = bucket.len();
 
         // Both keys might still be there, or key1 might be cleaned
         assert!(
@@ -806,6 +847,6 @@ mod tests {
         }
 
         // All keys should be retained
-        assert_eq!(bucket.tokens.len(), 10);
+        assert_eq!(bucket.len(), 10);
     }
 }
