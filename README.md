@@ -147,17 +147,17 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tokio-rate-limit = "0.6"
+tokio-rate-limit = "0.7"
 
 # For Axum middleware support
-tokio-rate-limit = { version = "0.6", features = ["middleware"] }
+tokio-rate-limit = { version = "0.7", features = ["middleware"] }
 
 # For Tonic gRPC middleware support
-tokio-rate-limit = { version = "0.6", features = ["tonic-support"] }
+tokio-rate-limit = { version = "0.7", features = ["tonic-support"] }
 
 # For observability (tracing + metrics)
-tokio-rate-limit = { version = "0.6", features = ["middleware", "observability"] }
-tokio-rate-limit = { version = "0.6", features = ["middleware", "metrics-support"] }
+tokio-rate-limit = { version = "0.7", features = ["middleware", "observability"] }
+tokio-rate-limit = { version = "0.7", features = ["middleware", "metrics-support"] }
 ```
 
 ### Basic Usage
