@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2025-01-07
+
+### Documentation
+
+- **Complete README.md update** with comprehensive v0.7.0 probabilistic rate limiting documentation
+- Updated top performance tagline to reflect v0.7.0 (20.5M ops/sec probabilistic)
+- Updated features list with v0.7.0 performance claims (20.5M ops/sec)
+- Updated Governor comparison table with v0.7.0 numbers (20.5M probabilistic / 16.2M deterministic)
+- Added comprehensive "What's New in v0.7.0" section with feature highlights and previous releases
+- Added **RELEASE_CHECKLIST.md** - Comprehensive 300+ line checklist for future releases
+  - Pre-release verification steps (code, tests, benchmarks)
+  - Documentation update checklist covering 6+ README sections
+  - Git commit and tag templates
+  - Common mistakes to avoid (documents v0.7.1 learnings)
+  - Post-release verification steps
+  - Emergency procedures for incorrect publishes
+
+**README.md now linear with release history:**
+- All v0.7.0 features properly documented across all sections
+- Performance numbers consistent (tagline, features, comparisons)
+- Clear progression: v0.7.0 → v0.6.0 → v0.5.0 → v0.4.0
+- "What's New" section shows current and previous releases
+
+**No code changes** - Documentation-only release to ensure crates.io displays complete v0.7.0 information.
+
+## [0.7.1] - 2025-01-07
+
+### Documentation
+
+- **Updated README.md** with comprehensive v0.7.0 probabilistic rate limiting documentation
+- Added probabilistic algorithm examples and usage guidance to README
+- Updated all version strings from 0.6 to 0.7
+- Clarified when to use probabilistic vs deterministic algorithms
+- Added performance comparison table for probabilistic sampling
+
+**No code changes** - This is a documentation-only release to ensure crates.io displays the correct information for v0.7.0 features.
+
 ## [0.7.0] - 2025-01-07
 
 ### Added
