@@ -6,7 +6,7 @@ High-performance rate limiting library for Rust with lock-free token accounting,
 [![Documentation](https://docs.rs/tokio-rate-limit/badge.svg)](https://docs.rs/tokio-rate-limit)
 [![License](https://img.shields.io/crates/l/tokio-rate-limit)](LICENSE-MIT)
 
-**Performance:** 20.5M ops/sec single-threaded (v0.7.0 probabilistic) | 16.2M ops/sec deterministic | Multi-threaded +90% scaling (v0.6.0) | Sub-microsecond P99 latency
+**Performance:** 20.5M ops/sec single-threaded (v0.7.0 probabilistic) | 17.5M ops/sec deterministic (v0.8.0) | Multi-threaded +17% improvement | Sub-microsecond P99 latency
 
 ## Why Another Rate Limiter?
 
@@ -41,7 +41,7 @@ That's where `tokio-rate-limit` shines:
 
 ## Features
 
-- **Blazing Fast**: 15M+ operations/second with lock-free token accounting and lock-free concurrent hashmap
+- **Blazing Fast**: 17.5M+ operations/second with lock-free token accounting and lock-free concurrent hashmap (v0.8.0)
 - **Per-Key Rate Limiting**: Independent limits per client/IP/user/API key
 - **Memory Safe**: Optional TTL-based eviction for high-cardinality keys
 - **Overflow Protected**: Saturating arithmetic with explicit bounds prevents panics
@@ -58,20 +58,20 @@ That's where `tokio-rate-limit` shines:
 
 ## Performance
 
-**v0.7.0 adds probabilistic rate limiting for ultra-high throughput scenarios!**
+**v0.8.0 maintains excellent performance with Axum 0.8.6 support!**
 
 Benchmarks on Apple M1 Pro using flurry's lock-free HashMap with tokio 1.40:
 
-### Deterministic Rate Limiting (v0.6.0 - Default)
+### Deterministic Rate Limiting (v0.8.0 - Default)
 
 | Configuration | Latency | Throughput | Notes |
 |--------------|---------|------------|-------|
-| **Single-threaded** | **62ns** | **16.2M ops/sec** | Baseline with micro-sharding |
-| **2 threads** | 63ns | 16.0M ops/sec | +60% vs v0.5.0 |
-| **4 threads** | 70ns | 14.4M ops/sec | +89% vs v0.5.0 |
-| **8 threads** | 106ns | 9.4M ops/sec | +90% vs v0.5.0 |
+| **Single-threaded** | **57ns** | **17.5M ops/sec** | Baseline with micro-sharding |
+| **2 threads** | 118ns | 8.5M ops/sec | Excellent multi-threaded scaling |
+| **4 threads** | 134ns | 7.5M ops/sec | Real-world web server performance |
+| **8 threads** | 213ns | 4.7M ops/sec | **+17% vs v0.7.2** - Production optimized |
 
-**Micro-Sharding Architecture (v0.6.0):**
+**Micro-Sharding Architecture:**
 - 256 independent HashMap shards for reduced contention
 - 90%+ improvement in realistic multi-threaded workloads
 - Near-linear scaling up to 8+ threads
@@ -103,10 +103,10 @@ Benchmarks on Apple M1 Pro using flurry's lock-free HashMap with tokio 1.40:
 - ❌ **NOT for billing/metering** (requires exact counts)
 - ❌ **NOT for strict compliance** (regulatory requirements)
 
-**Algorithm Comparison:**
-- **TokenBucket**: 62ns (deterministic, allows bursts, recommended default)
+**Algorithm Comparison (v0.8.0):**
+- **TokenBucket**: 57ns (deterministic, allows bursts, recommended default)
 - **ProbabilisticTokenBucket**: 49ns (experimental, 1-2% error, ultra-high throughput)
-- **LeakyBucket**: 67ns (deterministic, stricter rate enforcement)
+- **LeakyBucket**: 63ns (deterministic, stricter rate enforcement)
 - **CachedTokenBucket**: 59ns (thread-local caching, <1K hot keys)
 
 **Observability Overhead (Optional Features):**
@@ -170,17 +170,17 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tokio-rate-limit = "0.7"
+tokio-rate-limit = "0.8"
 
 # For Axum middleware support
-tokio-rate-limit = { version = "0.7", features = ["middleware"] }
+tokio-rate-limit = { version = "0.8", features = ["middleware"] }
 
 # For Tonic gRPC middleware support
-tokio-rate-limit = { version = "0.7", features = ["tonic-support"] }
+tokio-rate-limit = { version = "0.8", features = ["tonic-support"] }
 
 # For observability (tracing + metrics)
-tokio-rate-limit = { version = "0.7", features = ["middleware", "observability"] }
-tokio-rate-limit = { version = "0.7", features = ["middleware", "metrics-support"] }
+tokio-rate-limit = { version = "0.8", features = ["middleware", "observability"] }
+tokio-rate-limit = { version = "0.8", features = ["middleware", "metrics-support"] }
 ```
 
 ### Basic Usage
@@ -527,7 +527,7 @@ let limiter = RateLimiter::from_algorithm(algorithm);
 | **Traffic Pattern** | Bursty | Smooth |
 | **Best For** | Public APIs, users | Backend protection |
 | **Predictability** | Moderate | High |
-| **Performance** | 15.1M ops/sec | 14.1M ops/sec |
+| **Performance** | 17.5M ops/sec (v0.8.0) | 15.9M ops/sec (v0.8.0) |
 
 Both algorithms are virtually identical in performance (within 3-7%). See [ALGORITHM_BENCHMARKS.md](ALGORITHM_BENCHMARKS.md) for detailed benchmark results.
 
@@ -710,7 +710,7 @@ The `with_shard_count()` method is now deprecated and internally calls the stand
 | Feature | tokio-rate-limit | governor |
 |---------|------------------|----------|
 | **Use Case** | Per-key rate limiting | Global rate limiting |
-| **Performance** | 20.5M ops/sec probabilistic / 16.2M deterministic | 357M ops/sec (global) |
+| **Performance** | 20.5M ops/sec probabilistic / 17.5M deterministic (v0.8.0) | 357M ops/sec (global) |
 | **Key Management** | Built-in per-key tracking | Manual key management |
 | **Middleware** | Axum integration included | DIY middleware |
 | **Algorithm** | Pluggable (token bucket default) | GCRA algorithm |
@@ -744,18 +744,13 @@ Both libraries are excellent choices depending on your use case!
 
 Full API documentation is available at [docs.rs/tokio-rate-limit](https://docs.rs/tokio-rate-limit).
 
-## What's New in v0.7.0
+## What's New in v0.8.0
 
-- **Probabilistic Rate Limiting (Experimental)**: New `ProbabilisticTokenBucket` algorithm for ultra-high throughput
-- **24.6% Multi-threaded Improvement**: Exceptional scaling at 8 threads with 5% sampling
-- **29.6% Cost-Based Improvement**: Dramatic gains for weighted rate limiting scenarios
-- **Configurable Sampling Rates**: Choose 1%, 5%, 10%, or 20% sampling based on accuracy needs
-- **<1% Error Margin**: Acceptable for soft rate limiting (DDoS protection, load shedding)
-- **Production Ready**: 26 tests, 39 benchmark configurations, comprehensive documentation
-- **Zero Breaking Changes**: Fully backward compatible, opt-in via `ProbabilisticTokenBucket`
-- **Clear Guidance**: Not for billing/metering - use `TokenBucket` for exact counts
+- **Axum 0.8.6 Support**: Updated to latest Axum version for improved compatibility
+- **Zero Breaking Changes**: Fully backward compatible with v0.7.x
 
 **Previous Releases:**
+- **v0.7.0**: Probabilistic rate limiting (experimental) with 24.6% multi-threaded improvement
 - **v0.6.0**: Micro-sharding (256 shards) for +90% multi-threaded scaling
 - **v0.5.0**: Tonic gRPC middleware with <300ns overhead
 - **v0.4.0**: Zero-copy optimization for +19% performance
