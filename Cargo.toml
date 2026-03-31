@@ -1,12 +1,12 @@
 [package]
 name = "tokio-rate-limit"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 rust-version = "1.75.0"
 authors = ["Daniel Curtis <drc@danielryancurtis.com>"]
 description = "High-performance, lock-free rate limiting library with pluggable algorithms and Axum middleware"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/danielrcurtis/tokio-rate-limit"
+repository = "https://github.com/sadco-io/tokio-rate-limit"
 documentation = "https://docs.rs/tokio-rate-limit"
 keywords = ["rate-limit", "rate-limiting", "token-bucket", "axum", "middleware"]
 categories = ["web-programming", "asynchronous", "network-programming"]
@@ -70,7 +70,7 @@ redis = { version = "0.32.7", features = ["tokio-comp", "connection-manager"] }
 # Alternative concurrent hashmaps for testing
 dashmap = "6.1"
 papaya = "0.2.3"
-scc = "3.3.5"
+scc = "3.6.12"
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14.2", optional = true }

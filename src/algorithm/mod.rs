@@ -9,7 +9,9 @@ mod token_bucket;
 
 // v0.6.0 experimental optimizations
 mod cached_token_bucket;
+#[allow(deprecated)]
 mod simd_token_bucket;
+#[allow(deprecated)]
 mod zerocopy_token_bucket;
 
 // v0.7.0 probabilistic rate limiting
@@ -20,7 +22,9 @@ pub use token_bucket::TokenBucket;
 
 // Experimental exports (v0.6.0)
 pub use cached_token_bucket::CachedTokenBucket;
+#[allow(deprecated)]
 pub use simd_token_bucket::SimdTokenBucket;
+#[allow(deprecated)]
 pub use zerocopy_token_bucket::ZeroCopyTokenBucket;
 
 // Probabilistic exports (v0.7.0)
@@ -93,19 +97,12 @@ pub trait Algorithm: Send + Sync + private::Sealed {
     ///
     /// # Default Behavior
     ///
-    /// The default implementation rejects requests with cost > 1 if there aren't
-    /// enough remaining tokens. Algorithms should override this for proper
-    /// weighted rate limiting support.
-    async fn check_with_cost(&self, key: &str, cost: u64) -> Result<RateLimitDecision> {
-        if cost == 1 {
-            self.check(key).await
-        } else {
-            // Default: check if we have enough tokens for the cost
-            let mut decision = self.check(key).await?;
-            if cost > 1 && decision.remaining.unwrap_or(0) < cost {
-                decision.permitted = false;
-            }
-            Ok(decision)
-        }
+    /// The default implementation delegates to `check()` for cost == 1.
+    /// For cost > 1, it falls back to `check()` as well — concrete algorithms
+    /// should override this method for proper weighted rate limiting support.
+    async fn check_with_cost(&self, key: &str, _cost: u64) -> Result<RateLimitDecision> {
+        // Default: delegate to check() for all costs.
+        // Concrete algorithms override this with proper cost-aware consumption.
+        self.check(key).await
     }
 }

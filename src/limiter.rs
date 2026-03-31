@@ -280,7 +280,7 @@ impl RateLimiter {
                     "Rate limit check: PERMITTED"
                 );
             } else {
-                info!(
+                debug!(
                     remaining = decision.remaining,
                     limit = decision.limit,
                     retry_after_ms = decision.retry_after.map(|d| d.as_millis()),
@@ -338,7 +338,7 @@ impl RateLimiter {
                     "Rate limit check with cost: PERMITTED"
                 );
             } else {
-                info!(
+                debug!(
                     remaining = decision.remaining,
                     limit = decision.limit,
                     cost = cost,
