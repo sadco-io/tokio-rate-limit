@@ -9,10 +9,6 @@ pub enum Error {
     #[error("Rate limit exceeded")]
     RateLimitExceeded,
 
-    /// Invalid configuration was provided.
-    #[error("Invalid configuration: {0}")]
-    InvalidConfig(String),
-
     /// Configuration error.
     #[error("Configuration error: {0}")]
     Config(String),

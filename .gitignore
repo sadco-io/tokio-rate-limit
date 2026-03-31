@@ -3,6 +3,8 @@
 # Development and planning docs (not for crates.io)
 ROADMAP.md
 .DS_Store
+._*
+.cursor/
 
 # Benchmark artifacts
 benchmark_results.txt

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-03-30
+
+### Fixed
+- **`retry_after` calculation used `ceil()` producing 10x over-waits** — e.g. at 10 tok/s returned 1s instead of 100ms. Now returns accurate fractional wait times. Fixes incorrect `Retry-After` HTTP headers in Axum middleware.
+- **`check_with_cost` default trait impl consumed 1 token even when denying** — the default now delegates to `check()` without side effects. All concrete algorithms already override this correctly so no user impact, but the default was a trap for future impls.
+- **Crate-level docs referenced DashMap** — removed in v0.2.0, now correctly describes flurry + 256-shard architecture.
+- **Denied requests logged at `info!` level** — changed to `debug!` to avoid flooding log pipelines under load.
+
+### Changed
+- Deprecated `SimdTokenBucket` (no SIMD benefit, use `TokenBucket`) and `ZeroCopyTokenBucket` (integrated into `TokenBucket` since v0.4.0).
+- Removed unused `Error::InvalidConfig` variant (dead code, `Error::Config` is the active variant).
+- Updated repository URL to `sadco-io/tokio-rate-limit`.
+
+### Documentation
+- Added missing v0.8.0 changelog entry.
+
+## [0.8.0] - 2025-11-01
+
+### Changed
+- Updated to Axum 0.8.6 support (from 0.7.x). Zero breaking API changes.
+
 ## [0.7.2] - 2025-01-07
 
 ### Documentation

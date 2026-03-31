@@ -4,9 +4,9 @@
 //!
 //! ## Features
 //!
-//! - **Lock-free token accounting**: Atomic operations on token counts (10M+ ops/sec)
-//! - **Sharded state management**: Fine-grained per-shard locking via DashMap
-//! - **Pluggable algorithms**: Token bucket (more coming soon)
+//! - **Lock-free token accounting**: Atomic operations on token counts (17M+ ops/sec)
+//! - **256-shard state management**: Lock-free concurrent hashmap (flurry) with micro-sharding
+//! - **Pluggable algorithms**: Token bucket, leaky bucket, probabilistic sampling
 //! - **Axum middleware**: Drop-in rate limiting for web apps
 //! - **Zero allocations**: In the hot path
 //!
@@ -14,7 +14,7 @@
 //!
 //! This library uses a hybrid approach for maximum performance:
 //! - **Token updates**: True lock-free atomic compare-and-swap operations
-//! - **Key lookup**: Sharded concurrent hashmap (DashMap) with per-shard locking
+//! - **Key lookup**: 256-shard lock-free concurrent hashmap (flurry) for near-linear multi-threaded scaling
 //!
 //! This design provides excellent concurrency while maintaining per-key isolation.
 //!

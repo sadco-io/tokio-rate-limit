@@ -499,7 +499,7 @@ impl Algorithm for TokenBucket {
             // We need 1 token, and we refill at refill_rate_per_second tokens/sec
             let tokens_needed = 1u64.saturating_sub(remaining);
             let seconds_to_wait = if self.refill_rate_per_second > 0 {
-                (tokens_needed as f64 / self.refill_rate_per_second as f64).ceil()
+                tokens_needed as f64 / self.refill_rate_per_second as f64
             } else {
                 1.0
             };
@@ -569,7 +569,7 @@ impl Algorithm for TokenBucket {
             // Calculate how long until we'll have enough tokens available
             let tokens_needed = cost.saturating_sub(remaining);
             let seconds_to_wait = if self.refill_rate_per_second > 0 {
-                (tokens_needed as f64 / self.refill_rate_per_second as f64).ceil()
+                tokens_needed as f64 / self.refill_rate_per_second as f64
             } else {
                 1.0
             };
@@ -761,15 +761,10 @@ mod tests {
 
         let retry_after = decision.retry_after.unwrap();
         // At 10 tokens/sec, we need 0.1 seconds per token = 100ms
-        // The calculation is: tokens_needed (1) / refill_rate (10) = 0.1 sec = 100ms
-        // But our implementation uses ceil() and has a minimum wait
-        // With 0 tokens and needing 1, tokens_needed = 1 - 0 = 1
-        // seconds_to_wait = ceil(1.0 / 10.0) = ceil(0.1) = 1.0 second!
-        // That's the bug - ceil(0.1) returns 1.0 in the calculation
-        // So we expect 1000ms, not 100ms (that's actually correct given our implementation)
+        // tokens_needed (1) / refill_rate (10) = 0.1 sec = 100ms
         assert!(
-            retry_after.as_millis() >= 900 && retry_after.as_millis() <= 1100,
-            "Retry after should be ~1000ms, got {}ms",
+            retry_after.as_millis() >= 50 && retry_after.as_millis() <= 150,
+            "Retry after should be ~100ms, got {}ms",
             retry_after.as_millis()
         );
     }
