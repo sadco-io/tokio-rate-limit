@@ -61,7 +61,7 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["full", "test-util"] }
-criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
+criterion = { version = "0.8", features = ["async_tokio", "html_reports"] }
 axum = "0.8.9"
 tower = "0.5"
 hyper = "1.11"
