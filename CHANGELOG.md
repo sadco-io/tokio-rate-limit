@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-25
 ### Performance
+
 
 - **`ProbabilisticTokenBucket` unsampled fast path.** Profiling on a host
   without a working `clock_gettime` vDSO (WSL2) attributed ~60% of the
@@ -21,9 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per request removed), the TTL `last_access` store is skipped entirely when
   no TTL is configured, and the per-request sampler tick is isolated on its
   own cache line so it no longer invalidates the token level for concurrent
-  readers. Measured on the same host, `sample_rate = 100` went from ~1.05x
-  the deterministic `TokenBucket` single-threaded to ~2.6x, and from parity
-  to ~27x under 8-thread hot-key contention. Decisions are unchanged;
+  readers. Measured with `benches/probabilistic_tradeoff.rs` run identically
+  on the parent commit and this one, same host, with the deterministic
+  `TokenBucket` as an unchanged control (5.749 -> 5.784 us/op/thread at 8
+  threads): `sample_rate = 100` went from **1.05x to 4.9x** the deterministic
+  bucket single-threaded (155.8 -> 33.4 ns/op), and from **parity to 23.5x**
+  under 8-thread hot-key contention (5.838 us -> 246 ns/op/thread).
+  Decisions are unchanged;
   the only observable difference is that `RateLimitDecision::remaining` on
   fast-path admits omits refill accrued since the last sampled request. With
   an idle TTL configured the clock is still read on every request.
@@ -35,7 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   distribution over 100 independent runs per load/sampling-rate cell
   (`cargo test --release --test probabilistic_statistics -- --ignored`).
 
-## [0.9.0] - 2026-08-25
 
 ### Versioning
 
@@ -590,6 +595,7 @@ This is a pure internal optimization with no API changes. Existing code will aut
 
 ### Performance
 
+
 Benchmarks on Apple M1 Pro with tokio 1.40, flurry 0.5:
 
 - **Single-threaded**: 18.5M ops/sec (54ns latency)
@@ -798,6 +804,7 @@ let limiter = RateLimiter::from_algorithm(algorithm);
 
 ### Performance
 
+
 - LeakyBucket expected to match TokenBucket performance (15M+ ops/sec)
 - Minimal overhead for algorithm selection
 
@@ -857,6 +864,7 @@ Initial release of tokio-rate-limit, a high-performance, lock-free rate limiting
   - Extensible for future algorithms (leaky bucket, sliding window, etc.)
 
 ### Performance
+
 
 Benchmarked on Apple M1 Pro (darwin):
 
