@@ -249,6 +249,11 @@ the packaging and MSRV fixes without also taking the enforcement change.
   `grpc_tonic` and `grpc_tonic_client` examples, the `tonic_integration` test and the
   `tonic_middleware_bench` bench all reference `tonic` unconditionally. Each now
   declares `required-features = ["tonic-support"]`.
+- **`benches/tonic_middleware_bench.rs` had never compiled.** tonic 0.14 replaced
+  `tonic::body::BoxBody` (`UnsyncBoxBody<Bytes, Status>`) with `tonic::body::Body`;
+  the library moved with it, the bench did not. Nothing caught this because the crate
+  had no CI and building the `tonic-support` feature needs `protoc`. Now a type alias
+  swap, verified against a real protoc build.
 - `benches/dashmap_alternatives.rs` ported to the `scc` 3.8 API (`insert` / `read` are
   now `insert_sync` / `read_sync`).
 - Removed a dead `request_count` accumulator in `tests/probabilistic_accuracy.rs` and

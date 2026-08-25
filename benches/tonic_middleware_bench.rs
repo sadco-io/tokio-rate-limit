@@ -5,9 +5,7 @@
 
 #![cfg(feature = "tonic-support")]
 
-use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use http_body_util::combinators::UnsyncBoxBody;
 use std::sync::Arc;
 use tokio_rate_limit::tonic_middleware::{
     CustomGrpcKeyExtractor, GrpcKeyExtractor, GrpcRateLimitLayer, IpKeyExtractor,
@@ -16,7 +14,10 @@ use tokio_rate_limit::tonic_middleware::{
 use tokio_rate_limit::RateLimiter;
 use tower::{Layer, Service, ServiceExt};
 
-type BoxBody = UnsyncBoxBody<Bytes, tonic::Status>;
+// tonic 0.14 replaced `tonic::body::BoxBody`
+// (`UnsyncBoxBody<Bytes, Status>`) with `tonic::body::Body`. The library
+// moved with it; this bench had never been compiled, so it did not.
+type BoxBody = tonic::body::Body;
 
 // Mock gRPC service for benchmarking
 #[derive(Clone)]
