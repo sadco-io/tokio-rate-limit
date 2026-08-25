@@ -166,21 +166,21 @@ fn random_fraction_of(accrued: i64) -> i64 {
 
 /// Admission decision for a bucket holding `available` scaled tokens.
 ///
-/// Admits unconditionally once the bucket covers a whole lump, and otherwise
-/// admits with probability `available / lump`. The ramp is what turns the
-/// lumpy debit stream into a proportional deny rate: at equilibrium the bucket
-/// sits at the fill level where `offered_rate * available / lump == refill_rate`,
-/// so the admitted rate is the refill rate.
+/// Admits unconditionally once the bucket covers the whole ramp, and otherwise
+/// admits with probability `available / ramp`. The ramp is what turns the lumpy
+/// debit stream into a proportional deny rate: at equilibrium the bucket sits
+/// at the fill level where `offered_rate * available / ramp == refill_rate`, so
+/// the admitted rate is the refill rate.
 #[inline]
-fn admit(available: i64, lump: i64) -> bool {
-    if available >= lump {
+fn admit(available: i64, ramp: i64) -> bool {
+    if available >= ramp {
         return true;
     }
     if available <= 0 {
         return false;
     }
-    // `lump` is >= 1 here because `available` is >= 1 and < `lump`.
-    (fast_random() % (lump as u64)) < (available as u64)
+    // `ramp` is >= 1 here because `available` is >= 1 and strictly less.
+    (fast_random() % (ramp as u64)) < (available as u64)
 }
 
 /// Clamps a signed scaled token count to the unscaled, non-negative count
