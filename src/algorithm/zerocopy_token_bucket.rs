@@ -157,7 +157,10 @@ impl AtomicTokenState {
 /// Note: flurry's current API requires String keys, so we still need to allocate
 /// on first access. However, subsequent accesses to the same key avoid allocation
 /// during the lookup phase.
-#[deprecated(since = "0.8.1", note = "Zero-copy optimization is now integrated into TokenBucket since v0.4.0.")]
+#[deprecated(
+    since = "0.8.1",
+    note = "Zero-copy optimization is now integrated into TokenBucket since v0.4.0."
+)]
 pub struct ZeroCopyTokenBucket {
     capacity: u64,
     refill_rate_per_second: u64,

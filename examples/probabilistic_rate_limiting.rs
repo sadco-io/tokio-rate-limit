@@ -67,24 +67,21 @@ async fn main() {
         "  1% sampling:             {:?} ({:.2}M ops/sec) - {:.1}% faster",
         prob_1pct_time,
         iterations as f64 / prob_1pct_time.as_secs_f64() / 1_000_000.0,
-        (baseline_time.as_secs_f64() - prob_1pct_time.as_secs_f64())
-            / baseline_time.as_secs_f64()
+        (baseline_time.as_secs_f64() - prob_1pct_time.as_secs_f64()) / baseline_time.as_secs_f64()
             * 100.0
     );
     println!(
         "  5% sampling:             {:?} ({:.2}M ops/sec) - {:.1}% faster",
         prob_5pct_time,
         iterations as f64 / prob_5pct_time.as_secs_f64() / 1_000_000.0,
-        (baseline_time.as_secs_f64() - prob_5pct_time.as_secs_f64())
-            / baseline_time.as_secs_f64()
+        (baseline_time.as_secs_f64() - prob_5pct_time.as_secs_f64()) / baseline_time.as_secs_f64()
             * 100.0
     );
     println!(
         "  10% sampling:            {:?} ({:.2}M ops/sec) - {:.1}% faster",
         prob_10pct_time,
         iterations as f64 / prob_10pct_time.as_secs_f64() / 1_000_000.0,
-        (baseline_time.as_secs_f64() - prob_10pct_time.as_secs_f64())
-            / baseline_time.as_secs_f64()
+        (baseline_time.as_secs_f64() - prob_10pct_time.as_secs_f64()) / baseline_time.as_secs_f64()
             * 100.0
     );
 
@@ -92,9 +89,11 @@ async fn main() {
 
     // Scenario 2: Rate limiting enforcement
     println!("🚦 Scenario 2: Rate Limit Enforcement");
-    println!("Testing with 10 req/sec limit, 50 capacity\n");
+    println!("Testing with 100 req/sec limit, 500 capacity\n");
 
-    let limiter = ProbabilisticTokenBucket::new(50, 10, 20); // 5% sampling
+    // capacity (500) is 25x one lump (sample_rate * cost = 20), well inside the
+    // "capacity >= 10 * sample_rate * cost" rule of thumb.
+    let limiter = ProbabilisticTokenBucket::new(500, 100, 20); // 5% sampling
 
     // Burst test
     println!("  Burst test (60 requests immediately):");
@@ -109,7 +108,7 @@ async fn main() {
         }
     }
     println!("    Allowed: {}, Denied: {}", allowed, denied);
-    println!("    (Expected: ~50 allowed due to burst capacity)");
+    println!("    (Expected: all 60 -- the burst capacity is 500)");
 
     // Wait for refill
     sleep(Duration::from_millis(1000)).await;
@@ -129,7 +128,7 @@ async fn main() {
         sleep(Duration::from_millis(10)).await; // 100 req/sec
     }
     println!("    Allowed: {}, Denied: {}", allowed, denied);
-    println!("    (Expected: ~60 allowed = 50 burst + 10 refilled)");
+    println!("    (Expected: all of them -- 500 burst + 100/sec refill)");
 
     println!("\n");
 
@@ -137,7 +136,10 @@ async fn main() {
     println!("💰 Scenario 3: Cost-Based Rate Limiting");
     println!("GPU resource allocation with weighted costs\n");
 
-    let gpu_limiter = ProbabilisticTokenBucket::new(1000, 100, 100); // 1% sampling
+    // Costs here go up to 100, so one lump at 1% sampling would be 10_000
+    // tokens against a 1_000-token bucket. With cost-based limiting the lump is
+    // `sample_rate * cost`, so the sampling rate has to come down accordingly.
+    let gpu_limiter = ProbabilisticTokenBucket::new(1000, 100, 5); // 20% sampling
 
     // Simulate GPU requests with different costs
     let requests = vec![
@@ -189,15 +191,13 @@ async fn main() {
     }
 
     let hot_key_time = start.elapsed();
-    println!(
-        "  Processed {} requests in {:?}",
-        iterations, hot_key_time
-    );
+    println!("  Processed {} requests in {:?}", iterations, hot_key_time);
     println!(
         "  Throughput: {:.2}M ops/sec",
         iterations as f64 / hot_key_time.as_secs_f64() / 1_000_000.0
     );
-    println!("  (5% sampling excels with hot keys!)");
+    println!("  (a hot key is the workload sampling helps most, and even");
+    println!("   there the gain is single-digit percent -- see the benchmark)");
 
     println!("\n");
 
@@ -205,16 +205,18 @@ async fn main() {
     println!("🏢 Scenario 5: Multi-Tenant Configuration");
     println!("Different sampling rates for different tiers\n");
 
-    // Free tier: 1% sampling (maximize speed, soft limits)
-    let free_tier = ProbabilisticTokenBucket::new(50, 10, 100);
+    // Free tier: small bucket, so no aggressive sampling -- one lump at 1%
+    // sampling would be twice the whole bucket. Sampling needs a bucket that
+    // holds many lumps; a low-traffic tier does not have one.
+    let free_tier = ProbabilisticTokenBucket::new(50, 10, 1);
 
-    // Pro tier: 10% sampling (better accuracy)
+    // Pro tier: 10% sampling -- capacity (500) holds 50 lumps.
     let pro_tier = ProbabilisticTokenBucket::new(500, 100, 10);
 
     // Enterprise: Deterministic (exact accuracy)
     let enterprise_tier = TokenBucket::new(5000, 1000);
 
-    println!("  Free tier: 1% sampling (50 burst, 10/sec)");
+    println!("  Free tier: no sampling (50 burst, 10/sec)");
     let decision = free_tier.check("free-user").await.unwrap();
     println!(
         "    Status: {}, Remaining: {}",
@@ -253,10 +255,15 @@ async fn main() {
     println!("\n");
     println!("=== Demo Complete ===");
     println!("\n📚 Key Takeaways:");
-    println!("  • 5% sampling (sample_rate=20) is recommended for most use cases");
-    println!("  • Provides 10-15% single-threaded improvement");
-    println!("  • Up to 24% improvement in multi-threaded scenarios");
-    println!("  • Best for high-throughput APIs (>1M req/sec)");
+    println!("  • Keep capacity >= 10 * sample_rate * cost -- a sampled request");
+    println!("    debits a whole `sample_rate * cost` lump, so a bucket that is");
+    println!("    not much larger than one lump is corrected too coarsely");
+    println!("  • The speed-up is a few percent, not a few times: the per-key");
+    println!("    lookup dominates, and sampling only removes the refill");
+    println!("    arithmetic and the compare-and-swap. Benchmark before choosing");
+    println!("    this over TokenBucket");
+    println!("  • sample_rate = 1 is exactly the deterministic TokenBucket");
     println!("  • Use deterministic for billing/compliance scenarios");
-    println!("\n📖 See PROBABILISTIC_ANALYSIS.md for detailed benchmarks and recommendations");
+    println!("\n📖 See benches/probabilistic_tradeoff.rs for the accuracy/throughput");
+    println!("   benchmark this guidance comes from");
 }

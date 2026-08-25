@@ -6,7 +6,7 @@ High-performance rate limiting library for Rust with lock-free token accounting,
 [![Documentation](https://docs.rs/tokio-rate-limit/badge.svg)](https://docs.rs/tokio-rate-limit)
 [![License](https://img.shields.io/crates/l/tokio-rate-limit)](LICENSE-MIT)
 
-**Performance:** 20.5M ops/sec single-threaded (v0.7.0 probabilistic) | 17.5M ops/sec deterministic (v0.8.0) | Multi-threaded +17% improvement | Sub-microsecond P99 latency
+**Performance:** 17.5M ops/sec single-threaded deterministic (v0.8.0) | Multi-threaded +17% improvement | Sub-microsecond P99 latency
 
 ## Why Another Rate Limiter?
 
@@ -20,7 +20,7 @@ That's where `tokio-rate-limit` shines:
 - ✅ **Drop-in Axum middleware** - Zero boilerplate, automatic 429 responses with RFC-compliant headers
 - ✅ **Cost-based limiting** - Different costs for different operations (NEW in v0.2.0)
 - ✅ **Production observability** - Optional tracing & metrics with zero overhead when disabled (NEW in v0.2.0)
-- ✅ **20.5M ops/sec performance** - Probabilistic sampling with micro-sharding (v0.7.0)
+- ✅ **High throughput** - Lock-free token accounting over 256 shards
 - ✅ **Memory safe** - TTL-based eviction prevents unbounded growth
 
 **Use Cases:**
@@ -78,34 +78,59 @@ Benchmarks on Apple M1 Pro using flurry's lock-free HashMap with tokio 1.40:
 - Optimized for web servers (Axum, Actix, Tonic) running on tokio
 - Real-world rate limiting is inherently multi-threaded
 
-### Probabilistic Rate Limiting (v0.7.0 - Experimental)
+### Probabilistic Rate Limiting (Experimental)
 
-**For ultra-high throughput scenarios where 1-2% error margin is acceptable:**
+`ProbabilisticTokenBucket` performs the token accounting on only one request in
+`sample_rate`; that request debits the whole group it stands in for. Requests
+are admitted with a probability proportional to the fill level, which is what
+keeps the deny rate proportional to the overload rather than lumpy.
 
-| Configuration | Latency | Throughput | Improvement |
-|--------------|---------|------------|-------------|
-| **Single-threaded (5% sampling)** | **49ns** | **20.5M ops/sec** | **+11.4%** |
-| **8 threads (5% sampling)** | **196ns** | **5.1M ops/sec** | **+24.6%** |
-| **Cost-based (1% sampling)** | **48ns** | **21.0M ops/sec** | **+29.6%** |
+> **The `sample_rate`-scaling defect fixed in 0.9.0 made this type's effective
+> limit `sample_rate`x the configured limit** -- at the documented 1% sampling
+> rate it applied no limiting at all. Do not use 0.8.x or earlier for
+> enforcement.
 
-**ProbabilisticTokenBucket (NEW in v0.7.0):**
-- Samples only X% of requests (configurable: 1%, 5%, 10%, 20%)
-- Dramatically reduces atomic operations
-- **Recommended: 5% sampling (20x rate)** for best balance
-- <1% error margin (acceptable for soft rate limiting)
-- Ideal for DDoS protection, load shedding, cost-based limiting
+**Accuracy** (`capacity = 2000`, `limit = 1000/s`, 10-second window, admitted
+count against the deterministic `TokenBucket` over 100 runs):
+
+| Offered load | `sample_rate = 10` | `sample_rate = 100` |
+|--------------|--------------------|---------------------|
+| at or below the limit | exact | exact |
+| 2x  | -0.1% (sd 0.7%) | -0.8% (sd 1.7%) |
+| 10x | +0.0% (sd 0.9%) | -0.4% (sd 1.1%) |
+
+`sample_rate = 1` disables sampling and is exactly the deterministic bucket.
+
+**Throughput.** Sampling is worth much less than previously claimed here. Every
+request still performs the key lookup, the TTL timestamp store and the sampling
+counter increment; only the refill arithmetic and the compare-and-swap loop are
+skipped, and the hash map lookup dominates. Measured on aarch64/WSL2 with
+`cargo bench --bench probabilistic_tradeoff`:
+
+| Workload | `TokenBucket` | `sample_rate = 100` | Gain |
+|----------|---------------|---------------------|------|
+| single thread, one key | 5.80 Mops/s | 6.06 Mops/s | +4.5% |
+| 8 threads, one hot key | 1.35 Mops/s | 1.38 Mops/s | +2.0% (within noise) |
+| single thread, 1000 keys | 4.85 Mops/s | 4.77 Mops/s | -1.6% |
+
+Absolute numbers are machine-specific; the ratios are the point. Run the bench
+on your own hardware before choosing this type over `TokenBucket`.
+
+**Sizing.** A sampled request debits a whole `sample_rate * cost` lump, so keep
+`capacity >= 10 * sample_rate * cost`. Below that the bucket is corrected too
+coarsely and denies more than it should.
 
 **When to use Probabilistic:**
-- ✅ Ultra-high throughput APIs (>1M req/sec)
-- ✅ Cost-based rate limiting scenarios
-- ✅ Soft rate limiting (DDoS protection, load shedding)
-- ✅ Multi-threaded hot-key workloads (8+ threads)
+- ✅ Very high request rates concentrated on a few hot keys
+- ✅ Soft rate limiting (DDoS protection, load shedding) where a bounded
+  overshoot is acceptable
 - ❌ **NOT for billing/metering** (requires exact counts)
 - ❌ **NOT for strict compliance** (regulatory requirements)
+- ❌ **NOT when `capacity` is close to `sample_rate * cost`**
 
 **Algorithm Comparison (v0.8.0):**
 - **TokenBucket**: 57ns (deterministic, allows bursts, recommended default)
-- **ProbabilisticTokenBucket**: 49ns (experimental, 1-2% error, ultra-high throughput)
+- **ProbabilisticTokenBucket**: experimental; a few percent faster than `TokenBucket` on a hot key, at the cost of `sample_rate`-grained accuracy
 - **LeakyBucket**: 63ns (deterministic, stricter rate enforcement)
 - **CachedTokenBucket**: 59ns (thread-local caching, <1K hot keys)
 
@@ -263,7 +288,7 @@ async fn main() {
 - ❌ Low throughput (<1M req/sec) - overhead not worth it
 - ❌ Zero tolerance for over-limit requests
 
-See `PROBABILISTIC_ANALYSIS.md` for comprehensive benchmarks and `examples/probabilistic_rate_limiting.rs` for production examples.
+See `benches/probabilistic_tradeoff.rs` for the accuracy/throughput benchmark and `examples/probabilistic_rate_limiting.rs` for usage examples. (`PROBABILISTIC_ANALYSIS.md` predates the 0.9.0 fix and its accuracy figures are not valid.)
 
 ### Cost-Based Rate Limiting *(NEW in v0.2.0)*
 
@@ -710,7 +735,7 @@ The `with_shard_count()` method is now deprecated and internally calls the stand
 | Feature | tokio-rate-limit | governor |
 |---------|------------------|----------|
 | **Use Case** | Per-key rate limiting | Global rate limiting |
-| **Performance** | 20.5M ops/sec probabilistic / 17.5M deterministic (v0.8.0) | 357M ops/sec (global) |
+| **Performance** | 17.5M ops/sec deterministic (v0.8.0) | 357M ops/sec (global) |
 | **Key Management** | Built-in per-key tracking | Manual key management |
 | **Middleware** | Axum integration included | DIY middleware |
 | **Algorithm** | Pluggable (token bucket default) | GCRA algorithm |
