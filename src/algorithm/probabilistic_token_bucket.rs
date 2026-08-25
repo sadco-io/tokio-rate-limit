@@ -47,10 +47,17 @@
 //!   requests, so the residual the bucket holds is O(one lump) in absolute
 //!   tokens, and short observation windows are noisier.
 //! - Sampling does **not** remove all shared-state traffic. Every request still
-//!   performs the key lookup, the TTL timestamp store and the sampling counter
-//!   increment; what sampling removes is the refill arithmetic and the
-//!   compare-and-swap loop. See `benches/probabilistic_tradeoff.rs` for what
-//!   that is actually worth.
+//!   performs the key lookup and the sampling counter increment. What the
+//!   unsampled path removes is the refill compare-and-swap loop and -- whenever
+//!   the credited token level already covers a whole lump, which is the common
+//!   case for a healthy bucket -- the clock read and refill arithmetic as well.
+//!   Skipping the clock there cannot change any admit/deny decision (the level
+//!   is already at admission probability 1 and refill only raises it); the only
+//!   observable difference is that the reported `remaining` omits refill
+//!   accrued since the last sample. With an idle TTL configured the clock is
+//!   read on every request regardless, because the TTL bookkeeping needs the
+//!   timestamp. See `benches/probabilistic_tradeoff.rs` and
+//!   `benches/component_breakdown.rs` for what this is actually worth.
 //!
 //! # When to Use
 //!
@@ -82,9 +89,10 @@ const NANOS_PER_SEC: u128 = 1_000_000_000;
 
 /// Maximum burst capacity to prevent overflow.
 ///
-/// Token counts are held in an `i64` (they may go transiently negative by at
-/// most one lump), so the bound is derived from `i64::MAX` rather than
-/// `u64::MAX`.
+/// Token counts are held in an `i64` (they may go transiently negative -- by
+/// up to one lump per thread whose sampled request raced an in-flight debit,
+/// i.e. O(threads * lump) in the worst interleaving), so the bound is derived
+/// from `i64::MAX` rather than `u64::MAX`.
 const MAX_BURST: u64 = (i64::MAX as u64) / (2 * SCALE);
 
 /// Maximum refill rate per second to prevent overflow.
@@ -96,12 +104,27 @@ const NUM_SHARDS: usize = 256;
 // Fast random number generator state (thread-local).
 // Using xorshift64 for speed: https://en.wikipedia.org/wiki/Xorshift
 thread_local! {
-    static RNG_STATE: std::cell::Cell<u64> = std::cell::Cell::new(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64
-    );
+    static RNG_STATE: std::cell::Cell<u64> = std::cell::Cell::new(rng_seed());
+}
+
+/// Per-thread RNG seed.
+///
+/// Mixes the wall clock with a per-thread stack address and runs the result
+/// through a splitmix64 finalizer. Seeding from the clock alone gave threads
+/// spawned within the same timer tick identical xorshift streams, which
+/// correlates the random sampler phases of the keys those threads create.
+fn rng_seed() -> u64 {
+    let stack_probe = 0u8;
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e37_79b9_7f4a_7c15)
+        ^ (std::ptr::addr_of!(stack_probe) as u64).rotate_left(32);
+    // splitmix64 finalizer: decorrelates nearby seeds.
+    seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    seed = (seed ^ (seed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    seed = (seed ^ (seed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    seed ^ (seed >> 31)
 }
 
 /// Fast thread-local random number generator.
@@ -190,30 +213,60 @@ fn remaining_of(available: i64) -> u64 {
     (available.max(0) as u64) / SCALE
 }
 
-/// Atomic state for a probabilistic token bucket.
-struct AtomicProbabilisticState {
-    /// Available tokens, scaled by [`SCALE`].
-    ///
-    /// Signed on purpose. A sampled request debits a whole lump
-    /// (`sample_rate * cost`), which can overdraw a bucket that was admitting
-    /// on the ramp. Allowing the count to go transiently negative (by strictly
-    /// less than one lump) is what keeps the estimator unbiased -- clamping at
-    /// zero would silently forgive part of every overdraft and make the limiter
-    /// systematically too permissive under sustained overload.
-    tokens: AtomicI64,
+/// A timestamp source that reads the clock at most once per request.
+///
+/// Reading the monotonic clock is not free -- on hosts without a working
+/// vDSO for `clock_gettime` (WSL2, some VMs) it is a ~100ns syscall, which
+/// measured as the single largest component of the per-request cost. The
+/// unsampled fast path can usually decide without a timestamp at all, so the
+/// clock is only read when a code path actually asks for it, and the value is
+/// memoized so every path in one request sees the same instant (exactly as
+/// when it was read unconditionally up front).
+struct LazyNow<'a> {
+    reference: &'a Instant,
+    cached: std::cell::Cell<Option<u64>>,
+}
 
-    /// Last refill timestamp in nanoseconds
-    last_refill_nanos: AtomicU64,
+impl<'a> LazyNow<'a> {
+    #[inline]
+    fn new(reference: &'a Instant) -> Self {
+        Self {
+            reference,
+            cached: std::cell::Cell::new(None),
+        }
+    }
 
-    /// Last access timestamp for TTL tracking
-    last_access_nanos: AtomicU64,
+    #[inline]
+    fn get(&self) -> u64 {
+        match self.cached.get() {
+            Some(now) => now,
+            None => {
+                let now = self.reference.elapsed().as_nanos() as u64;
+                self.cached.set(Some(now));
+                now
+            }
+        }
+    }
+}
 
+/// The per-key fields that are written on (nearly) every request, isolated on
+/// their own cache line.
+///
+/// The sampler tick is incremented by every request and the TTL timestamp is
+/// stored by every request when a TTL is configured. Keeping those writes off
+/// the line that holds `tokens`/`last_refill_nanos` lets the unsampled fast
+/// path -- which only *reads* the token level -- keep that line in the shared
+/// cache state under contention instead of bouncing it between cores on every
+/// request. (128 bytes covers the 128-byte prefetch pairs on common arm64 and
+/// x86 parts.)
+#[repr(align(128))]
+struct HotWrites {
     /// Per-key systematic sampler tick.
     ///
     /// Incremented once per request to this key; the requests where
     /// `tick % sample_rate == 0` are the sampled ones. Being per *key* rather
     /// than per thread is what makes the group size exactly `sample_rate`
-    /// however the requests are interleaved across threads or keys.
+    /// however the traffic is interleaved across threads or keys.
     ///
     /// A shared per-thread counter was tried first and is not viable: it
     /// aliases catastrophically against periodic key patterns. With 100 keys
@@ -231,6 +284,43 @@ struct AtomicProbabilisticState {
     /// The counter starts at a random phase so the sampled positions cannot be
     /// predicted by a client trying to dodge them.
     request_tick: AtomicU64,
+
+    /// Last access timestamp for TTL tracking.
+    ///
+    /// Only written when a TTL is configured; without one it is dead state and
+    /// the store is skipped entirely.
+    last_access_nanos: AtomicU64,
+}
+
+/// Atomic state for a probabilistic token bucket.
+///
+/// `#[repr(C)]` so that the read-mostly fields (`tokens`,
+/// `last_refill_nanos`) reliably land on a different cache line from the
+/// per-request writes in [`HotWrites`].
+#[repr(C)]
+struct AtomicProbabilisticState {
+    /// Available tokens, scaled by [`SCALE`].
+    ///
+    /// Signed on purpose. A sampled request debits a whole lump
+    /// (`sample_rate * cost`), which can overdraw a bucket that was admitting
+    /// on the ramp. Allowing the count to go transiently negative is what
+    /// keeps the estimator unbiased -- clamping at zero would silently forgive
+    /// part of every overdraft and make the limiter systematically too
+    /// permissive under sustained overload.
+    ///
+    /// The overdraft is strictly less than one lump when requests are
+    /// serialized; concurrent sampled requests that observed the level before
+    /// each other's debits landed can each contribute up to one further lump,
+    /// so the true bound is O(threads * lump). The debt always carries -- it
+    /// is repaid out of subsequent refill before anything is admitted again --
+    /// so the *long-run* admitted rate is unaffected.
+    tokens: AtomicI64,
+
+    /// Last refill timestamp in nanoseconds
+    last_refill_nanos: AtomicU64,
+
+    /// The fields written on (nearly) every request, on their own cache line.
+    hot: HotWrites,
 }
 
 impl AtomicProbabilisticState {
@@ -238,8 +328,10 @@ impl AtomicProbabilisticState {
         Self {
             tokens: AtomicI64::new(scaled(capacity)),
             last_refill_nanos: AtomicU64::new(now_nanos),
-            last_access_nanos: AtomicU64::new(now_nanos),
-            request_tick: AtomicU64::new(fast_random()),
+            hot: HotWrites {
+                request_tick: AtomicU64::new(fast_random()),
+                last_access_nanos: AtomicU64::new(now_nanos),
+            },
         }
     }
 
@@ -248,7 +340,7 @@ impl AtomicProbabilisticState {
     /// Exactly one request in `sample_rate` returns `true`, counted per key.
     #[inline]
     fn should_sample(&self, sample_rate: u32) -> bool {
-        let tick = self.request_tick.fetch_add(1, Ordering::Relaxed);
+        let tick = self.hot.request_tick.fetch_add(1, Ordering::Relaxed);
         tick % u64::from(sample_rate) == 0
     }
 
@@ -295,11 +387,24 @@ impl AtomicProbabilisticState {
     /// Read-only estimate of the current fill level, including refill that has
     /// accrued but has not been credited yet.
     ///
-    /// Two relaxed loads and no read-modify-write -- this is the whole point of
+    /// Two plain loads and no read-modify-write -- this is the whole point of
     /// the unsampled path.
+    ///
+    /// # Ordering
+    ///
+    /// The token load is `Acquire` so the subsequent `last_refill_nanos` load
+    /// cannot be satisfied ahead of it. [`apply_refill`](Self::apply_refill)
+    /// claims the interval (advancing `last_refill_nanos`) *before* crediting
+    /// `tokens`, so with this ordering a reader that observes a credit also
+    /// observes the matching claim and cannot double-count the accrual;
+    /// racing a concurrent refill can only *under*-estimate (a claimed but
+    /// not yet credited interval), which is the safe direction. With both
+    /// loads relaxed, a weakly-ordered CPU could hoist the timestamp load
+    /// above the token load and transiently over-estimate by up to one
+    /// inter-sample refill.
     #[inline]
     fn estimate(&self, capacity_scaled: i64, rate_scaled: u64, now_nanos: u64) -> i64 {
-        let current = self.tokens.load(Ordering::Relaxed);
+        let current = self.tokens.load(Ordering::Acquire);
         let last = self.last_refill_nanos.load(Ordering::Relaxed);
         let added = refill_tokens(now_nanos.saturating_sub(last), rate_scaled);
         current.saturating_add(added).min(capacity_scaled)
@@ -337,24 +442,40 @@ impl AtomicProbabilisticState {
     /// is what keeps the debit rate equal to the admitted rate and the deny
     /// rate proportional to the overload.
     ///
+    /// The clock is read through `now`, lazily: an unsampled request whose
+    /// credited token level already covers a whole lump admits without a
+    /// timestamp at all, because accrued-but-uncredited refill cannot change
+    /// that decision (the level is already at admission probability 1, and
+    /// refill only raises it). The decision function is therefore *identical*
+    /// to reading the clock unconditionally; only the cost moves.
+    ///
+    /// `track_access` is false when no TTL is configured, in which case the
+    /// per-request `last_access_nanos` store (and the timestamp it needs) is
+    /// skipped -- nothing ever reads it.
+    ///
     /// Returns `(permitted, remaining_tokens)`.
     fn try_consume_probabilistic(
         &self,
         capacity: u64,
         refill_rate_per_second: u64,
-        now_nanos: u64,
+        now: &LazyNow<'_>,
         cost: u64,
         sample_rate: u32,
+        track_access: bool,
     ) -> (bool, u64) {
-        // Update last access time (Relaxed is fine for TTL tracking)
-        self.last_access_nanos.store(now_nanos, Ordering::Relaxed);
+        if track_access {
+            // Relaxed is fine for TTL tracking.
+            self.hot
+                .last_access_nanos
+                .store(now.get(), Ordering::Relaxed);
+        }
 
         let capacity_scaled = scaled(capacity);
         let rate_scaled = refill_rate_per_second.saturating_mul(SCALE);
         let cost_scaled = scaled(cost);
 
         if sample_rate <= 1 {
-            return self.consume_exact(capacity_scaled, rate_scaled, now_nanos, cost_scaled);
+            return self.consume_exact(capacity_scaled, rate_scaled, now.get(), cost_scaled);
         }
 
         // What one sampled request pays on behalf of its group.
@@ -365,8 +486,20 @@ impl AtomicProbabilisticState {
         let ramp = lump.min(capacity_scaled).max(1);
 
         if !self.should_sample(sample_rate) {
-            // NON-SAMPLED PATH: two relaxed loads, no read-modify-write.
-            let available = self.estimate(capacity_scaled, rate_scaled, now_nanos);
+            // NON-SAMPLED PATH: relaxed loads, no read-modify-write.
+            //
+            // If the credited level alone already covers the ramp the request
+            // is admitted at probability 1 whatever the accrued refill is, so
+            // the clock read and the refill arithmetic are skipped entirely.
+            // This is the common case for a healthy (non-overloaded) bucket
+            // and is what makes the fast path fast. Only the reported
+            // `remaining` differs from the slow form (it omits refill accrued
+            // since the last sample); the admit/deny decision is identical.
+            let current = self.tokens.load(Ordering::Relaxed);
+            if current >= ramp {
+                return (true, remaining_of(current));
+            }
+            let available = self.estimate(capacity_scaled, rate_scaled, now.get());
             return (admit(available, ramp), remaining_of(available));
         }
 
@@ -386,7 +519,11 @@ impl AtomicProbabilisticState {
         // window restores the balance: the sampled request's observation is
         // then drawn from the same distribution as its group's, so
         // E[debit rate] == cost * E[admit rate] at every fill level.
-        let current = self.tokens.load(Ordering::Relaxed);
+        let now_nanos = now.get();
+        // Acquire pairs these two loads for the same reason as in
+        // [`estimate`](Self::estimate): observing a credited refill implies
+        // observing its claim, so the accrual cannot be double-counted.
+        let current = self.tokens.load(Ordering::Acquire);
         let last_refill = self.last_refill_nanos.load(Ordering::Relaxed);
         let accrued = refill_tokens(now_nanos.saturating_sub(last_refill), rate_scaled);
         let observed = current
@@ -567,11 +704,6 @@ impl ProbabilisticTokenBucket {
         bucket
     }
 
-    #[inline]
-    fn now_nanos(&self) -> u64 {
-        self.reference_instant.elapsed().as_nanos() as u64
-    }
-
     fn cleanup_idle(&self, now_nanos: u64) {
         if let Some(ttl) = self.idle_ttl {
             let ttl_nanos = ttl.as_nanos() as u64;
@@ -581,7 +713,7 @@ impl ProbabilisticTokenBucket {
                 let keys_to_remove: Vec<String> = shard
                     .iter(&guard)
                     .filter_map(|(key, state)| {
-                        let last_access = state.last_access_nanos.load(Ordering::Relaxed);
+                        let last_access = state.hot.last_access_nanos.load(Ordering::Relaxed);
                         let age = now_nanos.saturating_sub(last_access);
                         if age >= ttl_nanos {
                             Some(key.clone())
@@ -598,40 +730,36 @@ impl ProbabilisticTokenBucket {
         }
     }
 
-    /// Get the configured sampling rate.
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
+    /// Shared implementation of [`Algorithm::check`] and
+    /// [`Algorithm::check_with_cost`].
+    ///
+    /// The clock is wrapped in a [`LazyNow`] so the unsampled fast path can
+    /// decide without reading it; with a TTL configured it is read up front
+    /// (the TTL bookkeeping needs it anyway), which reproduces the previous
+    /// behaviour exactly.
+    ///
+    /// The per-key state is used through the flurry guard rather than cloned
+    /// out of the map: the guard keeps the entry alive for the duration of the
+    /// call, and skipping the `Arc` clone/drop removes two contended
+    /// reference-count updates per request.
+    fn check_impl(&self, key: &str, cost: u64) -> RateLimitDecision {
+        let now = LazyNow::new(&self.reference_instant);
+        let track_access = self.idle_ttl.is_some();
 
-    /// Get the total number of keys across all shards.
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.shards.iter().map(|shard| shard.len()).sum()
-    }
-}
-
-impl super::private::Sealed for ProbabilisticTokenBucket {}
-
-#[async_trait]
-impl Algorithm for ProbabilisticTokenBucket {
-    async fn check(&self, key: &str) -> Result<RateLimitDecision> {
-        let now = self.now_nanos();
-
-        // Probabilistic cleanup (1% of sampled requests)
-        if self.idle_ttl.is_some() && (fast_random() % (self.sample_rate as u64 * 100)) == 0 {
-            self.cleanup_idle(now);
+        // Probabilistic cleanup (amortized to ~1% of sampled requests).
+        if track_access && (fast_random() % (self.sample_rate as u64 * 100)) == 0 {
+            self.cleanup_idle(now.get());
         }
 
         let shard = self.get_shard(key);
         let guard = shard.guard();
-        let state = match shard.get(key, &guard) {
-            Some(state) => state.clone(),
+        let state: &AtomicProbabilisticState = match shard.get(key, &guard) {
+            Some(state) => state,
             None => {
-                let new_state = Arc::new(AtomicProbabilisticState::new(self.capacity, now));
-                let key_string = key.to_string();
-                match shard.try_insert(key_string, new_state.clone(), &guard) {
-                    Ok(_) => new_state,
-                    Err(current) => current.current.clone(),
+                let new_state = Arc::new(AtomicProbabilisticState::new(self.capacity, now.get()));
+                match shard.try_insert(key.to_string(), new_state, &guard) {
+                    Ok(inserted) => inserted,
+                    Err(not_inserted) => not_inserted.current,
                 }
             }
         };
@@ -639,69 +767,10 @@ impl Algorithm for ProbabilisticTokenBucket {
         let (permitted, remaining) = state.try_consume_probabilistic(
             self.capacity,
             self.refill_rate_per_second,
-            now,
-            1,
-            self.sample_rate,
-        );
-
-        let retry_after = if !permitted {
-            let tokens_needed = 1u64.saturating_sub(remaining);
-            let seconds_to_wait = if self.refill_rate_per_second > 0 {
-                (tokens_needed as f64 / self.refill_rate_per_second as f64).ceil()
-            } else {
-                1.0
-            };
-            Some(Duration::from_secs_f64(seconds_to_wait.max(0.001)))
-        } else {
-            None
-        };
-
-        let reset = if self.refill_rate_per_second > 0 && remaining < self.capacity {
-            let tokens_to_refill = self.capacity.saturating_sub(remaining);
-            let seconds_to_full = tokens_to_refill as f64 / self.refill_rate_per_second as f64;
-            Some(Duration::from_secs_f64(seconds_to_full.max(0.001)))
-        } else if remaining >= self.capacity {
-            Some(Duration::from_secs(0))
-        } else {
-            None
-        };
-
-        Ok(RateLimitDecision {
-            permitted,
-            retry_after,
-            remaining: Some(remaining),
-            limit: self.capacity,
-            reset,
-        })
-    }
-
-    async fn check_with_cost(&self, key: &str, cost: u64) -> Result<RateLimitDecision> {
-        let now = self.now_nanos();
-
-        if self.idle_ttl.is_some() && (fast_random() % (self.sample_rate as u64 * 100)) == 0 {
-            self.cleanup_idle(now);
-        }
-
-        let shard = self.get_shard(key);
-        let guard = shard.guard();
-        let state = match shard.get(key, &guard) {
-            Some(state) => state.clone(),
-            None => {
-                let new_state = Arc::new(AtomicProbabilisticState::new(self.capacity, now));
-                let key_string = key.to_string();
-                match shard.try_insert(key_string, new_state.clone(), &guard) {
-                    Ok(_) => new_state,
-                    Err(current) => current.current.clone(),
-                }
-            }
-        };
-
-        let (permitted, remaining) = state.try_consume_probabilistic(
-            self.capacity,
-            self.refill_rate_per_second,
-            now,
+            &now,
             cost,
             self.sample_rate,
+            track_access,
         );
 
         let retry_after = if !permitted {
@@ -726,13 +795,37 @@ impl Algorithm for ProbabilisticTokenBucket {
             None
         };
 
-        Ok(RateLimitDecision {
+        RateLimitDecision {
             permitted,
             retry_after,
             remaining: Some(remaining),
             limit: self.capacity,
             reset,
-        })
+        }
+    }
+
+    /// Get the configured sampling rate.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Get the total number of keys across all shards.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.shards.iter().map(|shard| shard.len()).sum()
+    }
+}
+
+impl super::private::Sealed for ProbabilisticTokenBucket {}
+
+#[async_trait]
+impl Algorithm for ProbabilisticTokenBucket {
+    async fn check(&self, key: &str) -> Result<RateLimitDecision> {
+        Ok(self.check_impl(key, 1))
+    }
+
+    async fn check_with_cost(&self, key: &str, cost: u64) -> Result<RateLimitDecision> {
+        Ok(self.check_impl(key, cost))
     }
 }
 

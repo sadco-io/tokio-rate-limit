@@ -149,6 +149,10 @@ harness = false
 name = "probabilistic_tradeoff"
 harness = false
 
+[[bench]]
+name = "component_breakdown"
+harness = false
+
 [profile.release]
 lto = true
 codegen-units = 1

@@ -217,6 +217,58 @@ fn single_thread(c: &mut Criterion) {
             },
         );
     }
+
+    // With an idle TTL the clock is read on every request (the TTL
+    // bookkeeping needs the timestamp), so the clock-skipping fast path does
+    // not apply. This row prices that.
+    group.bench_function("probabilistic_ttl/100", |b| {
+        let bucket = ProbabilisticTokenBucket::with_ttl(
+            BENCH_CAPACITY,
+            BENCH_RATE,
+            100,
+            std::time::Duration::from_secs(3600),
+        );
+        b.to_async(&runtime)
+            .iter(|| async { black_box(bucket.check(black_box("hot-key")).await) });
+    });
+    group.finish();
+}
+
+/// Throughput when every request is *denied*.
+///
+/// The unsampled fast path can only skip the clock while the credited level
+/// covers a whole lump; a bucket pinned at empty takes the slow confirm path
+/// (clock read + refill estimate) on every request. A deny-heavy workload --
+/// the DDoS case this type is documented for -- must therefore be priced
+/// separately from the healthy-bucket numbers above.
+fn deny_path(c: &mut Criterion) {
+    let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+
+    let mut group = c.benchmark_group("probabilistic/deny_path");
+    group.throughput(Throughput::Elements(1));
+
+    // Tiny bucket, negligible refill: after the first handful of requests
+    // everything is denied.
+    const DENY_CAPACITY: u64 = 10;
+    const DENY_RATE: u64 = 1;
+
+    group.bench_function("token_bucket_baseline", |b| {
+        let bucket = TokenBucket::new(DENY_CAPACITY, DENY_RATE);
+        b.to_async(&runtime)
+            .iter(|| async { black_box(bucket.check(black_box("hot-key")).await) });
+    });
+
+    for sample_rate in [1u32, 100] {
+        group.bench_with_input(
+            BenchmarkId::new("probabilistic", sample_rate),
+            &sample_rate,
+            |b, &sample_rate| {
+                let bucket = ProbabilisticTokenBucket::new(DENY_CAPACITY, DENY_RATE, sample_rate);
+                b.to_async(&runtime)
+                    .iter(|| async { black_box(bucket.check(black_box("hot-key")).await) });
+            },
+        );
+    }
     group.finish();
 }
 
@@ -348,6 +400,7 @@ criterion_group!(
     benches,
     accuracy_report,
     single_thread,
+    deny_path,
     contention,
     key_cardinality
 );

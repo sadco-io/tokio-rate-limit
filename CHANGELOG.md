@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **`ProbabilisticTokenBucket` unsampled fast path.** Profiling on a host
+  without a working `clock_gettime` vDSO (WSL2) attributed ~60% of the
+  per-request cost to the monotonic clock read -- not, as previously assumed,
+  to the hash-map lookup. The clock is now read lazily: an unsampled request
+  whose credited token level already covers a whole `sample_rate * cost` lump
+  admits without a timestamp (the decision is provably identical, since
+  accrued refill can only raise a level that is already at admission
+  probability 1), the per-key state is used through the flurry guard instead
+  of cloning the `Arc` out of the map (two contended reference-count updates
+  per request removed), the TTL `last_access` store is skipped entirely when
+  no TTL is configured, and the per-request sampler tick is isolated on its
+  own cache line so it no longer invalidates the token level for concurrent
+  readers. Measured on the same host, `sample_rate = 100` went from ~1.05x
+  the deterministic `TokenBucket` single-threaded to ~2.6x, and from parity
+  to ~27x under 8-thread hot-key contention. Decisions are unchanged;
+  the only observable difference is that `RateLimitDecision::remaining` on
+  fast-path admits omits refill accrued since the last sampled request. With
+  an idle TTL configured the clock is still read on every request.
+- New `benches/component_breakdown.rs` attributes the per-request cost
+  component by component, and `benches/probabilistic_tradeoff.rs` gained a
+  deny-path group (where the fast path cannot skip the clock) and an
+  idle-TTL row.
+- New `tests/probabilistic_statistics.rs` characterizes the admitted-count
+  distribution over 100 independent runs per load/sampling-rate cell
+  (`cargo test --release --test probabilistic_statistics -- --ignored`).
+
 ## [0.9.0] - 2026-08-25
 
 ### Versioning
