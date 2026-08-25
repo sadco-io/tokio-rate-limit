@@ -152,7 +152,10 @@ struct BatchRefillResult {
 }
 
 /// SIMD-optimized token bucket implementation
-#[deprecated(since = "0.8.1", note = "Experimental — no SIMD benefit. Use TokenBucket instead.")]
+#[deprecated(
+    since = "0.8.1",
+    note = "Experimental — no SIMD benefit. Use TokenBucket instead."
+)]
 pub struct SimdTokenBucket {
     capacity: u64,
     refill_rate_per_second: u64,

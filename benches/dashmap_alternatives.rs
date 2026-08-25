@@ -223,7 +223,7 @@ fn bench_scc(c: &mut Criterion) {
                 let now = now_nanos();
                 for i in 0..100 {
                     let key = format!("key-{}", i);
-                    let _ = map.insert(key, Arc::new(AtomicTokenState::new(1_000_000, now)));
+                    let _ = map.insert_sync(key, Arc::new(AtomicTokenState::new(1_000_000, now)));
                 }
 
                 b.iter_custom(|iters| {
@@ -240,7 +240,7 @@ fn bench_scc(c: &mut Criterion) {
 
                             for i in 0..iters {
                                 let key = format!("key-{}", i % 100);
-                                if let Some(entry) = map.read(&key, |_, v| Arc::clone(v)) {
+                                if let Some(entry) = map.read_sync(&key, |_, v| Arc::clone(v)) {
                                     let now = now_nanos();
                                     black_box(entry.try_consume(1_000_000, 100_000, now));
                                 }
@@ -436,8 +436,10 @@ fn bench_insert_operations(c: &mut Criterion) {
 
                             for i in 0..iters {
                                 let key = format!("key-{}-{}", thread_id, i);
-                                let _ = map
-                                    .insert(key, Arc::new(AtomicTokenState::new(1_000_000, now)));
+                                let _ = map.insert_sync(
+                                    key,
+                                    Arc::new(AtomicTokenState::new(1_000_000, now)),
+                                );
                             }
 
                             start.elapsed()

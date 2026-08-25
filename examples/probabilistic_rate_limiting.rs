@@ -67,24 +67,21 @@ async fn main() {
         "  1% sampling:             {:?} ({:.2}M ops/sec) - {:.1}% faster",
         prob_1pct_time,
         iterations as f64 / prob_1pct_time.as_secs_f64() / 1_000_000.0,
-        (baseline_time.as_secs_f64() - prob_1pct_time.as_secs_f64())
-            / baseline_time.as_secs_f64()
+        (baseline_time.as_secs_f64() - prob_1pct_time.as_secs_f64()) / baseline_time.as_secs_f64()
             * 100.0
     );
     println!(
         "  5% sampling:             {:?} ({:.2}M ops/sec) - {:.1}% faster",
         prob_5pct_time,
         iterations as f64 / prob_5pct_time.as_secs_f64() / 1_000_000.0,
-        (baseline_time.as_secs_f64() - prob_5pct_time.as_secs_f64())
-            / baseline_time.as_secs_f64()
+        (baseline_time.as_secs_f64() - prob_5pct_time.as_secs_f64()) / baseline_time.as_secs_f64()
             * 100.0
     );
     println!(
         "  10% sampling:            {:?} ({:.2}M ops/sec) - {:.1}% faster",
         prob_10pct_time,
         iterations as f64 / prob_10pct_time.as_secs_f64() / 1_000_000.0,
-        (baseline_time.as_secs_f64() - prob_10pct_time.as_secs_f64())
-            / baseline_time.as_secs_f64()
+        (baseline_time.as_secs_f64() - prob_10pct_time.as_secs_f64()) / baseline_time.as_secs_f64()
             * 100.0
     );
 
@@ -189,10 +186,7 @@ async fn main() {
     }
 
     let hot_key_time = start.elapsed();
-    println!(
-        "  Processed {} requests in {:?}",
-        iterations, hot_key_time
-    );
+    println!("  Processed {} requests in {:?}", iterations, hot_key_time);
     println!(
         "  Throughput: {:.2}M ops/sec",
         iterations as f64 / hot_key_time.as_secs_f64() / 1_000_000.0

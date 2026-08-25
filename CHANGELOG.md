@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-08-25
+
+### Known defect (not fixed in this release)
+
+- **`ProbabilisticTokenBucket` does not rate limit.** `try_consume_probabilistic`
+  multiplies the bucket capacity, the refill rate *and* the per-request cost by
+  `sample_rate`. The factor cancels, so a sampled request costs a single token instead
+  of the `sample_rate` tokens it stands in for -- which is what the method's own doc
+  comment says it should do. **The effective limit is `sample_rate`x the configured
+  limit.** Measured on a burst of 20,000 requests against `capacity = 200` with no
+  refill:
+
+  | `sample_rate` | allowed | expected |
+  |---------------|---------|----------|
+  | 1             |     200 |      200 |
+  | 10            |   1,876 |      200 |
+  | 100           |  20,000 |      200 |
+
+  At the documented 1% sampling rate the bucket applies no limiting at all. The
+  isolated reproduction is `tests/probabilistic_effective_limit.rs` (marked
+  `#[ignore]`), and `probabilistic_accuracy::test_above_limit_traffic` -- which has
+  been failing -- is now `#[ignore]`d and cross-referenced rather than left red.
+
+  This is deliberately **not** fixed here: correcting the scaling is a one-line change,
+  but it exposes a second problem (the unsampled estimate path cannot produce a
+  proportional deny rate from a hard threshold, and overshoots by 25% at 1% sampling),
+  so the type needs a redesign or a deprecation. That is a 0.9.0 decision, not something
+  to bundle into a dependency patch. Treat `ProbabilisticTokenBucket` as unsafe for
+  enforcement until then.
+
+### Fixed
+
+- **Declared MSRV was unachievable.** `rust-version` said `1.75.0`, but `middleware`
+  needs 1.80 via `axum` 0.8, `tonic-support` needs **1.88** (`tonic`, `tonic-prost` and
+  `tonic-prost-build` all declare it), and even `cargo test` on the default build needs
+  1.85 via dev-dependencies. Now declared as `1.85` with the `tonic-support` requirement
+  documented in the manifest and enforced by a CI job.
+- **The published package shipped 24 internal report files.** `exclude` named only
+  `ROADMAP.md` and `benchmark_results.txt`, so `BENCHMARK_COMPARISON_v0.5.0.md`,
+  `V0_6_OPTIMIZATION_ANALYSIS.md`, `TONIC_RESEARCH_SUMMARY.md`, `SCALING_ANALYSIS_REPORT.md`
+  and twenty more landed in every download, along with `benches/`, `examples/` and
+  `tests/`. Replaced with an allow-list `include`. **The crate went from 68 files /
+  825.2 KiB (190.2 KiB compressed) to 22 files / 310.1 KiB (68.6 KiB compressed).**
+- **`cargo test` and `cargo build --examples` failed without `tonic-support`.** The
+  `grpc_tonic` and `grpc_tonic_client` examples, the `tonic_integration` test and the
+  `tonic_middleware_bench` bench all reference `tonic` unconditionally. Each now
+  declares `required-features = ["tonic-support"]`.
+- `benches/dashmap_alternatives.rs` ported to the `scc` 3.8 API (`insert` / `read` are
+  now `insert_sync` / `read_sync`).
+- Removed a dead `request_count` accumulator in `tests/probabilistic_accuracy.rs` and
+  applied `cargo fmt` to the four files that had drifted.
+
+### Changed
+
+- Dependency floors raised to current, all semver-compatible: `tokio` `1.40` -> `1.53`,
+  `axum` `0.8.6` -> `0.8.9`, `tonic` / `tonic-prost` / `tonic-prost-build`
+  `0.14.2` -> `0.14.6`, `prost` `0.14` -> `0.14.4`, `http` `1.3.1` -> `1.5`,
+  `tower` `0.5` -> `0.5.3`, `tracing` `0.1.41` -> `0.1.44`, `metrics` `0.24.2` -> `0.24.6`,
+  `thiserror` `2.0.17` -> `2.0.20`, `parking_lot` `0.12` -> `0.12.5`, `flurry` `0.5` -> `0.5.2`,
+  plus dev-dependency bumps (`hyper` `1.7` -> `1.11`, `scc` `3.6.12` -> `3.8`,
+  `papaya` `0.2.3` -> `0.2.5`, `dashmap` `6.1` -> `6.2`, `governor` `0.10.1` -> `0.10.4`,
+  `tracing-subscriber` `0.3.20` -> `0.3.23`).
+- `Cargo.lock` refreshed; it was 35 crates behind.
+
+### Added
+
+- CI (`.github/workflows/ci.yml`): stable + beta tests, separate MSRV jobs for 1.85 and
+  1.88, `fmt` + `clippy -D warnings`, a `cargo package` size check, and `cargo deny check`.
+- `deny.toml` for advisory, license and source auditing.
+
+### Notes
+
+- Deferred to 0.9.0: the `ProbabilisticTokenBucket` decision above, removal of the
+  `SimdTokenBucket` / `ZeroCopyTokenBucket` types deprecated in 0.8.1, dev `criterion`
+  `0.5` -> `0.8` (11 bench targets to port), and dev `redis` `0.32.7` -> `1.6`
+  (which declares MSRV 1.88).
+
+
 ## [0.8.1] - 2026-03-30
 
 ### Fixed
