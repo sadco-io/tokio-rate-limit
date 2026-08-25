@@ -215,12 +215,13 @@ async fn test_burst_capacity() {
 /// carries a residual of roughly half a lump that it never spends. That shows
 /// up as denying *more* than the baseline, which is the safe direction.
 ///
-/// Measured over 100 independent runs after the fix:
+/// Measured over 100 independent runs after the fix (baseline: 699 admitted):
 ///
-/// - admitted: min 504, max 700, mean 598.7, sd 42.5 (baseline: 700)
-/// - deny rate: min 30.0%, max 49.6%, mean 40.1%
+/// - admitted: min 471, max 692, mean 591.4, sd 42.7
+/// - deny rate: min 30.8%, max 52.9%, mean 40.9%
+/// - ratio to the deterministic baseline: 0.674 .. 0.990 (never above it)
 ///
-/// A 20% floor is 4.7 standard deviations below the observed mean. The
+/// A 20% floor is 4.9 standard deviations below the observed mean. The
 /// assertion against the deterministic baseline below is the one that would
 /// actually catch a regression of the original defect -- pre-fix, this
 /// configuration admitted all 1000 requests.
@@ -243,7 +244,8 @@ async fn test_above_limit_traffic() {
     println!("  Deterministic baseline allowed: {}", baseline_allowed);
 
     // Must not be materially more permissive than the algorithm it approximates.
-    // Measured worst case over 100 runs was +3.6%; 10% is ~4 sd of headroom.
+    // Measured worst case over 100 runs was 0.990x the baseline -- it never
+    // exceeded it -- so 1.10x is about 4 sd of headroom.
     let ceiling = (baseline_allowed as f64 * 1.10) as u64;
     assert!(
         allowed <= ceiling,

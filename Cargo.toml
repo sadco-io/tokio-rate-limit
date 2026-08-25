@@ -145,6 +145,10 @@ required-features = ["tonic-support"]
 name = "probabilistic_comparison"
 harness = false
 
+[[bench]]
+name = "probabilistic_tradeoff"
+harness = false
+
 [profile.release]
 lto = true
 codegen-units = 1

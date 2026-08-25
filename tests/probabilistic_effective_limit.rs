@@ -111,24 +111,33 @@ async fn drive<A: Algorithm>(
 ///
 /// # Margin
 ///
-/// `3%` of the baseline's admitted count plus four lumps
-/// (`4 * sample_rate * cost` tokens). The lump term is there because the level
+/// `4%` of the baseline's admitted count plus six lumps
+/// (`6 * sample_rate * cost` tokens). The lump term is there because the level
 /// is only corrected once per `sample_rate` requests, so the residual the
-/// bucket holds is O(lump) in absolute tokens regardless of window length.
+/// bucket holds is O(one lump) in absolute tokens regardless of window length.
 ///
-/// The number is measured, not guessed. Over 25 independent runs of this whole
-/// matrix (`sample_rate = 1` is exact and contributes no error):
+/// The number is measured, not guessed. Over 100 independent runs of this whole
+/// matrix, against a baseline of 11_999 admitted:
 ///
-/// | load | `sample_rate` | mean error | sd | observed range |
-/// |------|---------------|-----------|-----|----------------|
-/// | 2x   | 10            | -9 req    | 64  | -132 .. +133   |
-/// | 2x   | 100           | -75 req   | 176 | -453 .. +217   |
-/// | 10x  | 10            | +30 req   | 99  | -149 .. +273   |
-/// | 10x  | 100           | -65 req   | 125 | -283 .. +212   |
+/// | load  | `sample_rate` | mean  | sd    | observed range |
+/// |-------|---------------|-------|-------|----------------|
+/// | 0.25x | any           | exact | exact | 0              |
+/// | 1x    | any           | exact | exact | 0              |
+/// | 2x    | 1             | exact | exact | 0              |
+/// | 2x    | 10            |  -8.4 |  80.9 | -210 .. +170   |
+/// | 2x    | 100           | -92.5 | 208.0 | -546 .. +387   |
+/// | 10x   | 1             | exact | exact | 0              |
+/// | 10x   | 10            |  +3.2 | 103.5 | -241 .. +316   |
+/// | 10x   | 100           | -48.8 | 129.0 | -293 .. +292   |
 ///
-/// against a baseline of 11_999 admitted. The threshold is 400 requests at
-/// `sample_rate = 10` and 760 at `sample_rate = 100`, i.e. about 4 standard
-/// deviations, and roughly 1.7x the worst value actually observed.
+/// (`sample_rate = 1` is not sampled at all, so it reproduces the baseline
+/// exactly; so does any load the bucket can absorb without denying.)
+///
+/// The resulting threshold is 540 requests at `sample_rate = 10` and 1_079 at
+/// `sample_rate = 100`, i.e. at least 4.7 standard deviations from the measured
+/// mean in both directions. For scale: before the fix this configuration
+/// admitted *every* offered request -- +67% at 2x and +733% at 10x -- so a 9%
+/// envelope still catches the defect by two orders of magnitude.
 #[tokio::test(start_paused = true)]
 async fn admitted_rate_tracks_deterministic_baseline() {
     const LIMIT: u64 = 1_000;

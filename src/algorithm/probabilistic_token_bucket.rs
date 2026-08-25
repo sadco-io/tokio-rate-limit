@@ -7,36 +7,50 @@
 //!
 //! # How it stays accurate
 //!
-//! Two properties make the estimate unbiased rather than merely cheap:
+//! Four properties, each of which is load-bearing:
 //!
-//! 1. **A sampled request debits `sample_rate * cost` tokens.** One request in
-//!    `sample_rate` is sampled, so the expected debit per admitted request is
-//!    `cost` -- the same as the deterministic algorithm.
-//! 2. **Admission is itself probabilistic near empty.** Because debits arrive in
-//!    lumps of `sample_rate * cost` tokens, a hard `tokens >= cost` threshold
-//!    cannot produce a proportional deny rate: the bucket is either "obviously
-//!    full" (admit everything) or "obviously empty" (deny everything) for a whole
-//!    inter-sample interval. Instead a request is admitted with probability
-//!    `min(1, tokens / lump)`. That makes the admitted rate a continuous,
-//!    monotone function of the fill level, and the bucket settles at the fill
-//!    level where `offered_rate * admit_probability == refill_rate`. In other
-//!    words the long-run admitted rate converges to `min(offered, refill_rate)`,
+//! 1. **Sampling is systematic and counted per key.** Each key carries its own
+//!    request counter, starting from a random phase; the requests where
+//!    `tick % sample_rate == 0` are sampled. The group a sampled request
+//!    represents is therefore *exactly* `sample_rate` requests, however the
+//!    traffic is interleaved across threads and keys. An independent coin flip
+//!    per request would make the group size geometric; a counter shared across
+//!    keys would alias against periodic key patterns.
+//! 2. **Admission is probabilistic near empty.** Because debits arrive in lumps
+//!    of `sample_rate * cost` tokens, a hard `tokens >= cost` threshold cannot
+//!    produce a proportional deny rate: the bucket would be either "obviously
+//!    full" (admit everything) or "obviously empty" (deny everything) for a
+//!    whole inter-sample interval. Instead a request is admitted with
+//!    probability `min(1, tokens / lump)`. The admitted rate is then a
+//!    continuous, monotone function of the fill level, and the bucket settles
+//!    where `offered_rate * admit_probability == refill_rate` -- so the
+//!    long-run admitted rate converges to `min(offered_rate, refill_rate)`,
 //!    which is exactly what the deterministic bucket does.
-//!
-//! Sampling is *systematic* (every `sample_rate`-th request seen by the thread,
-//! from a random starting phase) rather than an independent coin flip per
-//! request. Systematic sampling has much lower variance, which matters a great
-//! deal here because each sample moves the bucket by a whole lump.
+//! 3. **A sampled request observes the bucket at a random point in its
+//!    window.** A sampled request necessarily arrives at the *end* of the
+//!    refill window it represents, so the level it sees is systematically
+//!    fuller than what its group saw. Since that observation also gates the
+//!    debit, using it directly makes the bucket debit faster than it admits.
+//!    Rolling the observation back by a uniformly random fraction of the
+//!    accrued refill removes the bias.
+//! 4. **The debit is `lump * admit_probability`, charged deterministically**,
+//!    rather than a whole lump gated on a coin flip. Both are unbiased, but
+//!    gating a whole lump makes the token level a random walk with steps of one
+//!    lump, and that walk dominates the error.
 //!
 //! # Trade-off
 //!
 //! - `sample_rate = 1` is exactly the deterministic token bucket (no sampling,
 //!   no randomness, hard threshold).
 //! - Higher sample rates do less shared-state work per request but make the
-//!   bucket coarser: the token level is only corrected once per `sample_rate`
-//!   requests, so a burst against a cold bucket can overshoot the configured
-//!   capacity by up to about one lump (`sample_rate * cost` tokens) and short
-//!   observation windows are noisier.
+//!   bucket coarser: the level is only corrected once per `sample_rate`
+//!   requests, so the residual the bucket holds is O(one lump) in absolute
+//!   tokens, and short observation windows are noisier.
+//! - Sampling does **not** remove all shared-state traffic. Every request still
+//!   performs the key lookup, the TTL timestamp store and the sampling counter
+//!   increment; what sampling removes is the refill arithmetic and the
+//!   compare-and-swap loop. See `benches/probabilistic_tradeoff.rs` for what
+//!   that is actually worth.
 //!
 //! # When to Use
 //!
@@ -47,14 +61,14 @@
 //!
 //! - Billing, metering, or strict compliance (use [`TokenBucket`](super::TokenBucket)).
 //! - Buckets whose `capacity` is not comfortably larger than
-//!   `sample_rate * cost` -- there the lump granularity dominates.
+//!   `sample_rate * cost` -- there the lump granularity dominates. A good rule
+//!   of thumb is `capacity >= 10 * sample_rate * cost`.
 
 use crate::algorithm::Algorithm;
 use crate::error::Result;
 use crate::limiter::RateLimitDecision;
 use async_trait::async_trait;
 use flurry::HashMap as FlurryHashMap;
-use std::cell::Cell;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -90,25 +104,6 @@ thread_local! {
     );
 }
 
-thread_local! {
-    /// Systematic sampler tick.
-    ///
-    /// One counter per thread, shared by every bucket the thread touches. A
-    /// bucket with sampling rate `n` samples the requests where
-    /// `tick % n == 0`, which is every `n`-th request the thread makes to it.
-    /// The counter starts at a random phase so the sampled positions are not
-    /// predictable from outside.
-    ///
-    /// Systematic sampling is used in preference to an independent Bernoulli
-    /// draw because the debit granularity is a whole lump: with Bernoulli
-    /// sampling the gap between debits is geometric (standard deviation equal
-    /// to its mean), which shows up directly as burst overshoot and as noise in
-    /// the admitted rate. With a shared per-thread tick the sample count for a
-    /// *single hot key* is exact, and degrades gracefully towards Bernoulli
-    /// behaviour as one thread spreads its requests over many keys.
-    static SAMPLE_TICK: Cell<u64> = Cell::new(fast_random());
-}
-
 /// Fast thread-local random number generator.
 /// Uses xorshift64 algorithm for minimal overhead.
 #[inline]
@@ -123,18 +118,6 @@ fn fast_random() -> u64 {
         x ^= x << 17;
         state.set(x);
         x
-    })
-}
-
-/// Returns `true` if this request should perform the shared-state update.
-///
-/// Exactly one request in `sample_rate` returns `true` per thread.
-#[inline]
-fn should_sample(sample_rate: u32) -> bool {
-    SAMPLE_TICK.with(|tick| {
-        let current = tick.get();
-        tick.set(current.wrapping_add(1));
-        current % u64::from(sample_rate) == 0
     })
 }
 
@@ -224,6 +207,30 @@ struct AtomicProbabilisticState {
 
     /// Last access timestamp for TTL tracking
     last_access_nanos: AtomicU64,
+
+    /// Per-key systematic sampler tick.
+    ///
+    /// Incremented once per request to this key; the requests where
+    /// `tick % sample_rate == 0` are the sampled ones. Being per *key* rather
+    /// than per thread is what makes the group size exactly `sample_rate`
+    /// however the requests are interleaved across threads or keys.
+    ///
+    /// A shared per-thread counter was tried first and is not viable: it
+    /// aliases catastrophically against periodic key patterns. With 100 keys
+    /// visited round-robin and `sample_rate = 100`, `tick % 100 == 0` lands on
+    /// the same key every time, so one key is sampled on every request and the
+    /// other 99 are never sampled at all -- measured 90_109 admitted against a
+    /// deterministic baseline of 11_900.
+    ///
+    /// An independent Bernoulli draw per request avoids the aliasing but makes
+    /// the group size geometric rather than exactly `sample_rate`, and the
+    /// debit is capped at one lump: long gaps then under-debit. Measured at 2x
+    /// overload with 1% sampling that over-admitted by 26% on a single key and
+    /// swung between -33% and +38% across 100 keys.
+    ///
+    /// The counter starts at a random phase so the sampled positions cannot be
+    /// predicted by a client trying to dodge them.
+    request_tick: AtomicU64,
 }
 
 impl AtomicProbabilisticState {
@@ -232,7 +239,17 @@ impl AtomicProbabilisticState {
             tokens: AtomicI64::new(scaled(capacity)),
             last_refill_nanos: AtomicU64::new(now_nanos),
             last_access_nanos: AtomicU64::new(now_nanos),
+            request_tick: AtomicU64::new(fast_random()),
         }
+    }
+
+    /// Returns `true` if this request should perform the shared-state update.
+    ///
+    /// Exactly one request in `sample_rate` returns `true`, counted per key.
+    #[inline]
+    fn should_sample(&self, sample_rate: u32) -> bool {
+        let tick = self.request_tick.fetch_add(1, Ordering::Relaxed);
+        tick % u64::from(sample_rate) == 0
     }
 
     /// Credits elapsed time to the bucket.
@@ -347,7 +364,7 @@ impl AtomicProbabilisticState {
         // probability 1 and would deny even when completely full.
         let ramp = lump.min(capacity_scaled).max(1);
 
-        if !should_sample(sample_rate) {
+        if !self.should_sample(sample_rate) {
             // NON-SAMPLED PATH: two relaxed loads, no read-modify-write.
             let available = self.estimate(capacity_scaled, rate_scaled, now_nanos);
             return (admit(available, ramp), remaining_of(available));
