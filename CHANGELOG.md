@@ -7,35 +7,197 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.8.2] - 2026-08-25
+## [0.9.0] - 2026-08-25
 
-### Known defect (not fixed in this release)
+### Versioning
 
-- **`ProbabilisticTokenBucket` does not rate limit.** `try_consume_probabilistic`
-  multiplies the bucket capacity, the refill rate *and* the per-request cost by
-  `sample_rate`. The factor cancels, so a sampled request costs a single token instead
-  of the `sample_rate` tokens it stands in for -- which is what the method's own doc
-  comment says it should do. **The effective limit is `sample_rate`x the configured
-  limit.** Measured on a burst of 20,000 requests against `capacity = 200` with no
-  refill:
+This release was prepared as `0.8.2`, a dependency and packaging patch. It is
+released as **0.9.0** because the `ProbabilisticTokenBucket` fix below is a
+behaviour change, not a bug fix that users can take blindly:
 
-  | `sample_rate` | allowed | expected |
-  |---------------|---------|----------|
-  | 1             |     200 |      200 |
-  | 10            |   1,876 |      200 |
-  | 100           |  20,000 |      200 |
+- The effective limit drops by a factor of `sample_rate`. At the documented 1%
+  sampling rate that is **100x**. Traffic that previously passed will now be
+  denied, which is the point of the fix, but it is not something to ship in a
+  patch release that a user might take automatically.
+- `RateLimitDecision::remaining` changes meaning for this algorithm. It was
+  divided by `SCALE * sample_rate` and is now a real token count.
+- Users must review their sizing. A sampled request debits a whole
+  `sample_rate * cost` lump, so `capacity` needs to be comfortably larger than
+  one lump -- a rule of thumb of `capacity >= 10 * sample_rate * cost` is now
+  documented on `ProbabilisticTokenBucket::new`.
 
-  At the documented 1% sampling rate the bucket applies no limiting at all. The
-  isolated reproduction is `tests/probabilistic_effective_limit.rs` (marked
-  `#[ignore]`), and `probabilistic_accuracy::test_above_limit_traffic` -- which has
-  been failing -- is now `#[ignore]`d and cross-referenced rather than left red.
+The public Rust API is unchanged: `ProbabilisticTokenBucket::new`, `with_ttl`,
+`sample_rate` and the `Algorithm` impl all keep their signatures. Semver for a
+rate limiter is not only about the type signatures, though -- "limits to N per
+second" is the contract, and this release changes what the library actually
+does with a request. Releasing it as 0.8.2 would also mean a user could not take
+the packaging and MSRV fixes without also taking the enforcement change.
 
-  This is deliberately **not** fixed here: correcting the scaling is a one-line change,
-  but it exposes a second problem (the unsampled estimate path cannot produce a
-  proportional deny rate from a hard threshold, and overshoots by 25% at 1% sampling),
-  so the type needs a redesign or a deprecation. That is a 0.9.0 decision, not something
-  to bundle into a dependency patch. Treat `ProbabilisticTokenBucket` as unsafe for
-  enforcement until then.
+### Fixed
+
+- **`ProbabilisticTokenBucket` did not rate limit.** `try_consume_probabilistic`
+  multiplied the bucket capacity, the refill rate *and* the per-request cost by
+  `sample_rate`. The factor cancelled, so a sampled request cost a single token
+  instead of the `sample_rate` tokens it stands in for -- which is what the
+  method's own doc comment said it should do. **The effective limit was
+  `sample_rate`x the configured limit.** Measured on a burst of 20,000 requests
+  against `capacity = 200` with no refill:
+
+  | `sample_rate` | allowed before | allowed after | expected |
+  |---------------|----------------|---------------|----------|
+  | 1             |            200 |           200 |      200 |
+  | 10            |          1,876 |       191-200 |      200 |
+  | 100           |         20,000 |       101-200 |      200 |
+
+  At the documented 1% sampling rate the bucket applied no limiting at all.
+
+  Correcting the scaling is a one-line change, but on its own it produces a
+  limiter that cannot track the deterministic bucket, because debits then arrive
+  in lumps of `sample_rate * cost` tokens while the unsampled path has to answer
+  from a single stale read. Two variants were measured and rejected: comparing
+  the unsampled request against its own cost caps the deny rate near the
+  sampling rate (1% denied at 2x the limit, where 30% is correct), and mirroring
+  the sampled charge over-denies by 25% at exactly the limit rate. **A hard
+  threshold on the unsampled path cannot produce a proportional deny rate.**
+  The algorithm's internals were therefore redesigned around four properties:
+
+  1. **Sampling is systematic and counted per key.** Each key carries its own
+     request counter from a random phase, so the group a sampled request
+     represents is exactly `sample_rate` requests however the traffic is
+     interleaved. A per-*thread* counter was tried first and aliases
+     catastrophically against periodic key patterns: with 100 keys visited
+     round-robin and `sample_rate = 100`, one key is sampled on every request
+     and the other 99 never (90,109 admitted against a baseline of 11,900). An
+     independent coin flip per request avoids the aliasing but makes the group
+     size geometric -- measured +26% over-admission at 2x on a single key and a
+     -33%..+38% swing across 100 keys.
+  2. **Admission is probabilistic near empty**, with probability
+     `min(1, tokens / lump)` rather than a threshold. This is what makes the
+     deny rate proportional: the bucket settles at the fill level where
+     `offered_rate * admit_probability == refill_rate`, so the long-run admitted
+     rate converges to `min(offered_rate, refill_rate)` -- exactly what the
+     deterministic bucket does.
+  3. **A sampled request observes the bucket at a uniformly random point inside
+     the refill window it represents.** It necessarily *arrives* at the end of
+     that window, so the level it sees is systematically fuller than what its
+     group saw; since that observation also gates the debit, using it directly
+     made the bucket debit faster than it admits (347 admitted where the
+     deterministic bucket admits 700, at 2x with 1% sampling).
+  4. **The debit is `lump * admit_probability`, charged deterministically**,
+     rather than a whole lump gated on a coin flip. Both are unbiased, but the
+     coin-flip form makes the token level a random walk with steps of one lump.
+     Measured over 25 runs at 1% sampling and 10x overload it spread the
+     admitted count over -10.9%..+15.4% of the deterministic baseline; charging
+     `lump * p` holds it inside 1%.
+
+  Token accounting was also tightened while the code was open: the level is held
+  in an `i64` so an overdraft is carried rather than silently forgiven, refill is
+  computed in integer arithmetic with the sub-token remainder carried forward
+  instead of `f64` seconds, and the elapsed interval is claimed with a CAS before
+  it is credited so two concurrent samplers cannot credit the same interval
+  twice. `sample_rate = 1` now short-circuits to an exact, fully deterministic
+  path.
+
+  **Measured accuracy after the fix.** Admitted count against the deterministic
+  `TokenBucket` on the same virtual timeline, `capacity = 2000`,
+  `limit = 1000/s`, 10-second window, 100 independent runs
+  (`tests/probabilistic_effective_limit.rs`):
+
+  | offered load | `sample_rate` | mean error | sd | observed range |
+  |--------------|---------------|-----------|-----|----------------|
+  | 0.25x        | 1 / 10 / 100  | exact | exact | 0 |
+  | 1x           | 1 / 10 / 100  | exact | exact | 0 |
+  | 2x           | 1             | exact | exact | 0 |
+  | 2x           | 10            |  -8.4 req |  80.9 | -210 .. +170 |
+  | 2x           | 100           | -92.5 req | 208.0 | -546 .. +387 |
+  | 10x          | 1             | exact | exact | 0 |
+  | 10x          | 10            |  +3.2 req | 103.5 | -241 .. +316 |
+  | 10x          | 100           | -48.8 req | 129.0 | -293 .. +292 |
+
+  against a baseline of 11,999 admitted -- i.e. within 0.8% on average and 4.6%
+  worst case, where the defect was 100x. A no-refill burst is now capped at the
+  configured capacity for every sampling rate.
+
+- **`RateLimitDecision::remaining` under-reported for `ProbabilisticTokenBucket`.**
+  It was divided by `SCALE * sample_rate`; it is now a real token count.
+- **`deny.toml` did not pass `cargo deny check licenses`.** `tiny-keccak`
+  (via `flurry` -> `ahash` -> `const-random`) is CC0-1.0, which was not in the
+  allow list. CC0-1.0 is a public domain dedication with no obligations; added
+  with a comment naming the crate that needs it. `cargo deny check` is now clean
+  on all four checks.
+
+### Changed
+
+- **`tests/probabilistic_accuracy.rs::test_above_limit_traffic` threshold
+  lowered from `deny_rate >= 30%` to `>= 20%`, and the test now compares against
+  a deterministic `TokenBucket` run on the same timeline.** The 30% figure is
+  not attainable by *any* approximation of the deterministic bucket, including a
+  perfect one: with `capacity = 200`, `limit = 100` and 1000 requests offered
+  over 5 virtual seconds the deterministic bucket admits exactly
+  200 (burst) + 500 (refill) = 700 and denies exactly 300, i.e. 30.00%. It is
+  the target value, not a lower bound -- an unbiased estimator sits on it and
+  crosses below half the time. Measured over 100 runs after the fix: admitted
+  471-692 (mean 591.4, sd 42.7) against a baseline of 699, deny rate 30.8%-52.9%
+  (mean 40.9%), never exceeding the baseline. A 20% floor is 4.9 standard
+  deviations below the mean. The added assertion that the probabilistic bucket
+  admits no more than 1.10x the deterministic one is the one that would catch a
+  regression of the original defect -- pre-fix this configuration admitted all
+  1000 requests. This configuration is also the pathological corner for
+  sampling: one lump is half the entire bucket.
+
+- **The performance claim for `ProbabilisticTokenBucket` was overstated.** The
+  module documented "50-100x faster" at 1% sampling. Sampling never removed all
+  the shared-state traffic: every request still performs the key lookup, the TTL
+  timestamp store, and (now) the sampling counter increment. What it removes is
+  the refill arithmetic and the compare-and-swap loop -- which is not the
+  dominant cost. Measured on this machine (aarch64, WSL2, `cargo bench`,
+  uncontended single thread, buckets sized so nothing is denied), the
+  *pre-fix* code was already only 7% faster than the deterministic
+  `TokenBucket` at 1% sampling: 6.29 Mops/s against 5.86. The docs now describe
+  the trade-off honestly and point at `benches/probabilistic_tradeoff.rs`.
+
+### Added
+
+- **`benches/probabilistic_tradeoff.rs`** (new `[[bench]]` target). Reports both
+  halves of the trade-off, because throughput alone is not meaningful for a
+  sampling limiter -- a bucket that admits everything is infinitely fast. It
+  prints a deterministic, virtual-clock accuracy table (admitted count and deny
+  rate against the deterministic baseline, across sampling rates, offered loads,
+  key interleaving, and bucket sizing) before running criterion groups for the
+  uncontended path, contention on one hot key at 1/2/4/8 threads, and key
+  cardinality.
+
+  Throughput on this machine (aarch64, WSL2; median of criterion's estimate;
+  `Mops/s`, higher is better). The fix costs 1-6%, within about 3x of the
+  run-to-run noise on the unchanged baseline (1.3%):
+
+  | benchmark | before | after | delta |
+  |-----------|--------|-------|-------|
+  | single thread, `TokenBucket` baseline | 5.86 | 5.80 | -1.1% (noise) |
+  | single thread, `sample_rate = 1`      | 5.84 | 5.51 | -5.7% |
+  | single thread, `sample_rate = 10`     | 6.09 | 6.01 | -1.3% |
+  | single thread, `sample_rate = 20`     | 6.37 | 6.18 | -3.0% |
+  | single thread, `sample_rate = 100`    | 6.29 | 6.06 | -3.7% |
+  | 8 threads on one key, baseline        | 1.41 | 1.35 | -4.1% |
+  | 8 threads on one key, `sample_rate = 10`  | 1.41 | 1.40 | -0.4% |
+  | 8 threads on one key, `sample_rate = 100` | 1.43 | 1.38 | -4.0% |
+  | 1000 keys, baseline                   | 4.89 | 4.85 | -0.8% |
+  | 1000 keys, `sample_rate = 100`        | 5.01 | 4.77 | -4.7% |
+
+  The headline is not the delta, it is the level: sampling buys **3-8%** over
+  the deterministic bucket on this workload, not 50-100x, because the per-key
+  hash map lookup dominates. Under contention on a single hot key the advantage
+  is inside the noise at every thread count.
+
+- **`tests/probabilistic_effective_limit.rs`** now asserts, rather than
+  documents, the effective limit: a no-refill burst is capped at capacity for
+  every sampling rate, and the long-run admitted count tracks the deterministic
+  `TokenBucket` across four offered loads and three sampling rates. Both this
+  file and `probabilistic_accuracy::test_above_limit_traffic` were `#[ignore]`d
+  for the defect and now run by default. Stability: 1,150 release-mode runs of
+  the two statistical test binaries and 25 debug-mode runs of the full suite,
+  with one unexplained failure that did not reproduce in 1,000 subsequent runs
+  and produced no captured assertion text.
 
 ### Fixed
 
@@ -79,10 +241,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Notes
 
-- Deferred to 0.9.0: the `ProbabilisticTokenBucket` decision above, removal of the
-  `SimdTokenBucket` / `ZeroCopyTokenBucket` types deprecated in 0.8.1, dev `criterion`
-  `0.5` -> `0.8` (11 bench targets to port), and dev `redis` `0.32.7` -> `1.6`
-  (which declares MSRV 1.88).
+- `cargo update` moved one crate: `combine` `4.6.7` -> `4.6.8` (transitive, dev-only
+  via `redis`). `cargo deny check advisories` is clean across all 232 crates with
+  all features enabled, and no crate in the graph is yanked. Three major bumps are
+  available and were **not** taken, none of them for a security reason: dev
+  `criterion` `0.5.1` -> `0.8.2` (11 bench targets to port), dev `redis`
+  `0.32.7` -> `1.6.0` (declares MSRV 1.88, above the crate's 1.85 floor), and
+  `matchit` `0.8.4` -> `0.8.6`, which is not ours to take -- `axum` 0.8.9 pins it
+  as `=0.8.4`.
+- Deferred: removal of the `SimdTokenBucket` / `ZeroCopyTokenBucket` types
+  deprecated in 0.8.1.
 
 
 ## [0.8.1] - 2026-03-30

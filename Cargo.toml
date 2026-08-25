@@ -1,6 +1,6 @@
 [package]
 name = "tokio-rate-limit"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2021"
 # 1.85 is the floor for the default build and for `middleware`.
 # The `tonic-support` feature additionally requires 1.88 -- tonic,
