@@ -39,12 +39,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # 1.85 covers the default build and the `middleware` feature.
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo build
       - run: cargo build --features middleware,observability,metrics-support
       # `tonic-support` pulls tonic/tonic-prost, which declare rust-version 1.88.
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - name: install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo build --features tonic-support
