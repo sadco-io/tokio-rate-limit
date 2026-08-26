@@ -13,9 +13,9 @@
 //! - Hot-key workloads (80/20 distribution)
 
 use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, PlotConfiguration,
-    Throughput,
+    criterion_group, criterion_main, BenchmarkId, Criterion, PlotConfiguration, Throughput,
 };
+use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;

@@ -4,8 +4,9 @@
 //!
 //! Compares tokio-rate-limit against governor (popular existing crate)
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use governor::{Quota, RateLimiter as GovernorLimiter};
+use std::hint::black_box;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use tokio::runtime::Runtime;

@@ -2,8 +2,9 @@
 //!
 //! Compares in-memory rate limiter with Redis-backed implementation
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use redis::RedisError;
+use std::hint::black_box;
 use std::sync::Arc;
 use std::thread;
 use tokio::runtime::Runtime;

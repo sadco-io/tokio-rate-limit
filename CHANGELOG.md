@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-08-26
+
+Dev-dependency maintenance only. Nothing in the published crate changed --
+no source file under `src/` was touched, and the shipped dependency set is
+identical to 0.9.0.
+
+### Changed
+
+- **`criterion` 0.5.1 -> 0.8.2** (dev-dependency). criterion 0.6 deprecated its
+  own `criterion::black_box` re-export in favour of `std::hint::black_box`,
+  which produced 196 deprecation warnings across the twelve criterion bench
+  targets. All twelve now import `black_box` from `std::hint` -- the same
+  function at its new path. No benchmark logic, group, sample size or
+  measurement window changed, so results remain comparable with the numbers
+  published for 0.9.0.
+- **`redis` 0.32.7 -> 1.6.0** (dev-dependency). Used only by
+  `benches/redis_comparison.rs`, which is excluded from CI because it needs a
+  live Redis. Despite the major, the four API surfaces the bench uses --
+  `redis::Client::open`, `redis::aio::ConnectionManager::new`,
+  `redis::Script::new(..).key(..).arg(..).invoke_async(..)` and
+  `redis::RedisError` -- are unchanged, so the bench compiles and its Lua
+  token-bucket script is untouched. Note for anyone re-running it: redis 1.0
+  gave async connections default timeouts where 0.32 had none, so a saturated
+  server can now surface a timeout error rather than blocking.
+
+  redis 1.6.0 declares `rust-version = 1.88`, above this crate's 1.85 floor.
+  That is harmless: the `msrv` job is build-only (`cargo build`), which does
+  not compile dev-dependencies. Verified by running the job's exact commands
+  against 1.85.0 and 1.88.0 locally.
+
 ## [0.9.0] - 2026-08-25
 ### Performance
 
