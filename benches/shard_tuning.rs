@@ -5,8 +5,9 @@
 //! This benchmark helps identify the optimal shard count for DashMap to minimize
 //! multi-threaded contention in the token bucket implementation.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use dashmap::DashMap;
+use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;

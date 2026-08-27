@@ -17,7 +17,8 @@
 //! The accuracy report uses a paused tokio clock advanced by hand, so it is a
 //! function of the algorithm alone and is reproducible on any machine.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Builder;

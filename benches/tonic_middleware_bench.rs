@@ -5,7 +5,8 @@
 
 #![cfg(feature = "tonic-support")]
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
 use std::sync::Arc;
 use tokio_rate_limit::tonic_middleware::{
     CustomGrpcKeyExtractor, GrpcKeyExtractor, GrpcRateLimitLayer, IpKeyExtractor,
