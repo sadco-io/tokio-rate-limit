@@ -84,7 +84,16 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 # Examples and integration tests that need a non-default feature. Without
-# these, `cargo test` / `cargo build --examples` fail to resolve `tonic`.
+# these, `cargo test` / `cargo build --examples` fail because `middleware`
+# / `tonic` are cfg-gated out of the library.
+
+[[example]]
+name = "axum_middleware"
+required-features = ["middleware"]
+
+[[example]]
+name = "custom_key_extraction"
+required-features = ["middleware"]
 
 [[test]]
 name = "tonic_integration"

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `cargo test` / `cargo build --examples` with default features compile again.
+  `axum_middleware` and `custom_key_extraction` now declare
+  `required-features = ["middleware"]`, matching the tonic targets.
+
 ## [0.10.0] - 2026-08-28
 
 Breaking correctness and API cleanup. The 0.9.0 sampler rewrite was right;
