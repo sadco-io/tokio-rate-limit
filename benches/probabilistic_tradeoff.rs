@@ -398,13 +398,17 @@ fn zipf_fairness_report() {
     );
 
     let rows = zipf::fairness_rows(
-        &offered,
-        &tb,
-        &p20,
-        &p100,
-        ZIPF_CAPACITY,
-        ZIPF_RATE,
-        ZIPF_WINDOW_SECS,
+        &zipf::AdmitCounts {
+            offered: &offered,
+            tb: &tb,
+            p20: &p20,
+            p100: &p100,
+        },
+        zipf::Quota {
+            capacity: ZIPF_CAPACITY,
+            rate: ZIPF_RATE,
+            window_secs: ZIPF_WINDOW_SECS,
+        },
         ZIPF_DECILES,
     );
 

@@ -6,7 +6,7 @@ mod zipf;
 
 use zipf::{
     count_offered, fairness_rows, pct_delta, rank_hottest_first, user_cap, xorshift64, zipf_cdf,
-    zipf_sample, zipf_sequence,
+    zipf_sample, zipf_sequence, AdmitCounts, Quota,
 };
 
 #[test]
@@ -105,7 +105,20 @@ fn deciles_are_hottest_first_equal_groups_plus_all() {
     let tb = offered.clone();
     let p20 = offered.clone();
     let p100 = vec![0u64; 10];
-    let rows = fairness_rows(&offered, &tb, &p20, &p100, 200, 100, 5, 2);
+    let rows = fairness_rows(
+        &AdmitCounts {
+            offered: &offered,
+            tb: &tb,
+            p20: &p20,
+            p100: &p100,
+        },
+        Quota {
+            capacity: 200,
+            rate: 100,
+            window_secs: 5,
+        },
+        2,
+    );
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].label, "D1");
     assert_eq!(rows[0].users, 5);
@@ -125,7 +138,20 @@ fn deciles_are_hottest_first_equal_groups_plus_all() {
 fn ten_thousand_users_split_into_ten_deciles_of_one_thousand() {
     let offered: Vec<u64> = (0..10_000).map(|i| 10_000 - i as u64).collect();
     let zeros = vec![0u64; 10_000];
-    let rows = fairness_rows(&offered, &zeros, &zeros, &zeros, 200, 100, 5, 10);
+    let rows = fairness_rows(
+        &AdmitCounts {
+            offered: &offered,
+            tb: &zeros,
+            p20: &zeros,
+            p100: &zeros,
+        },
+        Quota {
+            capacity: 200,
+            rate: 100,
+            window_secs: 5,
+        },
+        10,
+    );
     assert_eq!(rows.len(), 11);
     for (i, row) in rows.iter().take(10).enumerate() {
         assert_eq!(row.label, format!("D{}", i + 1));

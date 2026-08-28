@@ -86,16 +86,27 @@ pub struct FairnessRow {
     pub p100_admit: u64,
 }
 
+/// Per-user admit vectors for one replayed Zipf sequence.
+pub struct AdmitCounts<'a> {
+    pub offered: &'a [u64],
+    pub tb: &'a [u64],
+    pub p20: &'a [u64],
+    pub p100: &'a [u64],
+}
+
+/// Token-bucket window used to compute each user's configured cap.
+#[derive(Clone, Copy)]
+pub struct Quota {
+    pub capacity: u64,
+    pub rate: u64,
+    pub window_secs: u64,
+}
+
 fn sum_row(
     label: String,
     users: impl IntoIterator<Item = usize>,
-    offered: &[u64],
-    tb_admit: &[u64],
-    p20_admit: &[u64],
-    p100_admit: &[u64],
-    capacity: u64,
-    rate: u64,
-    window_secs: u64,
+    counts: &AdmitCounts<'_>,
+    quota: Quota,
 ) -> FairnessRow {
     let mut row = FairnessRow {
         label,
@@ -108,35 +119,31 @@ fn sum_row(
     };
     for i in users {
         row.users += 1;
-        row.offered += offered[i];
-        row.cap += user_cap(offered[i], capacity, rate, window_secs);
-        row.tb_admit += tb_admit[i];
-        row.p20_admit += p20_admit[i];
-        row.p100_admit += p100_admit[i];
+        row.offered += counts.offered[i];
+        row.cap += user_cap(
+            counts.offered[i],
+            quota.capacity,
+            quota.rate,
+            quota.window_secs,
+        );
+        row.tb_admit += counts.tb[i];
+        row.p20_admit += counts.p20[i];
+        row.p100_admit += counts.p100[i];
     }
     row
 }
 
 /// Split users into `n_deciles` equal groups by offered rank (D1 = hottest) plus an ALL row.
-pub fn fairness_rows(
-    offered: &[u64],
-    tb_admit: &[u64],
-    p20_admit: &[u64],
-    p100_admit: &[u64],
-    capacity: u64,
-    rate: u64,
-    window_secs: u64,
-    n_deciles: usize,
-) -> Vec<FairnessRow> {
-    assert_eq!(offered.len(), tb_admit.len());
-    assert_eq!(offered.len(), p20_admit.len());
-    assert_eq!(offered.len(), p100_admit.len());
+pub fn fairness_rows(counts: &AdmitCounts<'_>, quota: Quota, n_deciles: usize) -> Vec<FairnessRow> {
+    assert_eq!(counts.offered.len(), counts.tb.len());
+    assert_eq!(counts.offered.len(), counts.p20.len());
+    assert_eq!(counts.offered.len(), counts.p100.len());
     assert!(
-        n_deciles > 0 && offered.len() % n_deciles == 0,
+        n_deciles > 0 && counts.offered.len() % n_deciles == 0,
         "user count must be divisible by n_deciles"
     );
 
-    let ranked = rank_hottest_first(offered);
+    let ranked = rank_hottest_first(counts.offered);
     let per = ranked.len() / n_deciles;
     let mut rows = Vec::with_capacity(n_deciles + 1);
     for d in 0..n_deciles {
@@ -144,25 +151,15 @@ pub fn fairness_rows(
         rows.push(sum_row(
             format!("D{}", d + 1),
             slice.iter().copied(),
-            offered,
-            tb_admit,
-            p20_admit,
-            p100_admit,
-            capacity,
-            rate,
-            window_secs,
+            counts,
+            quota,
         ));
     }
     rows.push(sum_row(
         "ALL".to_string(),
-        0..offered.len(),
-        offered,
-        tb_admit,
-        p20_admit,
-        p100_admit,
-        capacity,
-        rate,
-        window_secs,
+        0..counts.offered.len(),
+        counts,
+        quota,
     ));
     rows
 }
