@@ -1,40 +1,29 @@
 //! Rate limiting algorithms.
 
-use crate::error::Result;
-use crate::limiter::RateLimitDecision;
-use async_trait::async_trait;
-
 mod leaky_bucket;
 mod token_bucket;
 
-// v0.6.0 experimental optimizations
 mod cached_token_bucket;
-#[allow(deprecated)]
-mod simd_token_bucket;
-#[allow(deprecated)]
-mod zerocopy_token_bucket;
-
-// v0.7.0 probabilistic rate limiting
 mod probabilistic_token_bucket;
+
+pub(crate) mod internal;
 
 pub use leaky_bucket::LeakyBucket;
 pub use token_bucket::TokenBucket;
 
-// Experimental exports (v0.6.0)
+/// Thread-local cached token bucket. Deprecated: the cache splits from the
+/// map under TTL eviction. Prefer [`TokenBucket`].
+#[allow(deprecated)]
 pub use cached_token_bucket::CachedTokenBucket;
-#[allow(deprecated)]
-pub use simd_token_bucket::SimdTokenBucket;
-#[allow(deprecated)]
-pub use zerocopy_token_bucket::ZeroCopyTokenBucket;
 
-// Probabilistic exports (v0.7.0)
 pub use probabilistic_token_bucket::ProbabilisticTokenBucket;
+
+use crate::limiter::RateLimitDecision;
 
 /// Private module for the sealed trait pattern.
 ///
 /// This prevents external implementations of the Algorithm trait while maintaining
-/// flexibility for internal algorithm implementations. This allows us to make
-/// breaking changes to the trait in the future without requiring a semver major bump.
+/// flexibility for internal algorithm implementations.
 mod private {
     pub trait Sealed {}
 }
@@ -42,67 +31,37 @@ mod private {
 /// Trait for rate limiting algorithms.
 ///
 /// Implementations of this trait define how rate limiting decisions are made.
-/// The trait is async to allow for potential I/O operations in custom implementations.
+/// The trait is synchronous: every in-tree algorithm is a pure atomic/hashmap
+/// operation. `RateLimiter::acquire` is the async wrapper that sleeps on
+/// `retry_after`.
 ///
 /// # Sealed Trait
 ///
-/// This trait is sealed and cannot be implemented outside of this crate. This design
-/// allows us to add new methods or change the trait in minor version updates without
-/// breaking semver guarantees. If you need a custom algorithm, please open an issue
-/// to discuss adding it to the library.
+/// This trait is sealed and cannot be implemented outside of this crate.
 ///
 /// # Available Algorithms
 ///
-/// - [`TokenBucket`] - Allows bursts up to capacity, refills at constant rate (zero-copy optimized in v0.4.0)
-/// - [`LeakyBucket`] - Enforces steady rate, smooths traffic (v0.3.0)
-/// - [`CachedTokenBucket`] - Thread-local cached token bucket for hot-key workloads (v0.4.0)
-///
-/// # Experimental Algorithms (Not Recommended for Production)
-///
-/// - [`ZeroCopyTokenBucket`] - Zero-copy prototype (integrated into TokenBucket in v0.4.0)
-/// - [`SimdTokenBucket`] - SIMD prototype (deferred, no performance benefit)
-///
-/// # Future Algorithms
-///
-/// - Sliding Window - More precise rate limiting
-#[async_trait]
+/// - [`TokenBucket`] — bursts up to capacity, refills at a constant rate (default)
+/// - [`LeakyBucket`] — enforces a steady rate, smooths traffic
+/// - [`ProbabilisticTokenBucket`] — samples 1 in `sample_rate` requests; soft limiting
+/// - `CachedTokenBucket` — deprecated; use [`TokenBucket`]
 pub trait Algorithm: Send + Sync + private::Sealed {
     /// Checks if a request for the given key should be permitted.
     ///
     /// # Arguments
     ///
     /// * `key` - A string identifier for the client/resource being rate limited
-    ///
-    /// # Returns
-    ///
-    /// A `RateLimitDecision` indicating whether the request is permitted and
-    /// additional metadata about the rate limit status.
-    async fn check(&self, key: &str) -> Result<RateLimitDecision>;
+    fn check(&self, key: &str) -> RateLimitDecision;
 
     /// Checks if a request with the given cost should be permitted.
     ///
-    /// Cost represents the number of tokens to consume. The default implementation
-    /// uses a cost of 1 (equivalent to `check()`), but algorithms can override this
-    /// to support weighted rate limiting.
+    /// Cost represents the number of tokens to consume and must be > 0.
+    /// A cost of 0 is rejected without consuming quota.
     ///
-    /// # Arguments
-    ///
-    /// * `key` - A string identifier for the client/resource being rate limited
-    /// * `cost` - Number of tokens to consume (must be > 0)
-    ///
-    /// # Returns
-    ///
-    /// A `RateLimitDecision` indicating whether the request is permitted and
-    /// additional metadata about the rate limit status.
-    ///
-    /// # Default Behavior
-    ///
-    /// The default implementation delegates to `check()` for cost == 1.
-    /// For cost > 1, it falls back to `check()` as well — concrete algorithms
-    /// should override this method for proper weighted rate limiting support.
-    async fn check_with_cost(&self, key: &str, _cost: u64) -> Result<RateLimitDecision> {
-        // Default: delegate to check() for all costs.
-        // Concrete algorithms override this with proper cost-aware consumption.
-        self.check(key).await
+    /// The default implementation delegates to [`check`](Self::check) and
+    /// ignores `cost`. Concrete algorithms override this.
+    fn check_with_cost(&self, key: &str, cost: u64) -> RateLimitDecision {
+        let _ = cost;
+        self.check(key)
     }
 }

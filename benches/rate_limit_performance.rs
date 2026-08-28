@@ -26,11 +26,12 @@ fn single_threaded_checks(c: &mut Criterion) {
             requests_per_second: 1_000_000, // High limit so we don't actually limit
             burst: 1_000_000,
         })
+        .unwrap()
     });
 
     c.bench_function("rate_limit/single_threaded", |b| {
         b.to_async(&rt).iter(|| async {
-            let result = limiter.check(black_box("test-key")).await;
+            let result = limiter.check(black_box("test-key"));
             black_box(result)
         });
     });
@@ -55,6 +56,7 @@ fn multi_threaded_checks(c: &mut Criterion) {
                         requests_per_second: 1_000_000,
                         burst: 1_000_000,
                     })
+                    .unwrap()
                 }));
 
                 b.iter_custom(|iters| {
@@ -73,7 +75,7 @@ fn multi_threaded_checks(c: &mut Criterion) {
                             rt.block_on(async {
                                 for i in 0..iters {
                                     let key = format!("thread-key-{}", i % 100);
-                                    let _ = black_box(limiter.check(black_box(&key)).await);
+                                    let _ = black_box(limiter.check(black_box(&key)));
                                 }
                             });
                             start.elapsed()
@@ -107,6 +109,7 @@ fn rate_limit_enforcement(c: &mut Criterion) {
             requests_per_second: 100,
             burst: 10,
         })
+        .unwrap()
     }));
 
     let counter = Arc::new(AtomicU64::new(0));
@@ -122,18 +125,18 @@ fn rate_limit_enforcement(c: &mut Criterion) {
 
                 // First 10 should succeed (burst)
                 for _ in 0..10 {
-                    assert!(limiter.check(black_box(&key)).await.unwrap().permitted);
+                    assert!(limiter.check(black_box(&key)).permitted);
                 }
 
                 // Next ones should fail (exhausted burst)
-                let result = limiter.check(black_box(&key)).await.unwrap();
+                let result = limiter.check(black_box(&key));
                 assert!(!result.permitted);
 
                 // Wait for refill
                 tokio::time::sleep(Duration::from_millis(100)).await;
 
                 // Should work again
-                let result = limiter.check(black_box(&key)).await.unwrap();
+                let result = limiter.check(black_box(&key));
                 black_box(result)
             }
         });
@@ -151,6 +154,7 @@ fn token_bucket_refill(c: &mut Criterion) {
             requests_per_second: 1000,
             burst: 100,
         })
+        .unwrap()
     }));
 
     let counter = Arc::new(AtomicU64::new(0));
@@ -166,14 +170,14 @@ fn token_bucket_refill(c: &mut Criterion) {
 
                 // Exhaust the bucket
                 for _ in 0..100 {
-                    let _ = limiter.check(black_box(&key)).await;
+                    let _ = limiter.check(black_box(&key));
                 }
 
                 // Wait for partial refill
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
                 // Check again (should have refilled ~50 tokens)
-                let result = limiter.check(black_box(&key)).await;
+                let result = limiter.check(black_box(&key));
                 black_box(result)
             }
         });

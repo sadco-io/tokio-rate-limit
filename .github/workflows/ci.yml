@@ -29,8 +29,6 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
-      - name: install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo test --all-features --lib --tests --examples
       - run: cargo test --all-features --doc
       # Benches are excluded above: `redis_comparison` needs a live Redis and
@@ -50,8 +48,6 @@ jobs:
       - run: cargo build --features middleware,observability,metrics-support
       # `tonic-support` pulls tonic/tonic-prost, which declare rust-version 1.88.
       - uses: dtolnay/rust-toolchain@1.88.0
-      - name: install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo build --features tonic-support
 
   lint:
@@ -64,8 +60,6 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-features --lib --tests --examples -- -D warnings
 

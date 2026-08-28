@@ -139,7 +139,7 @@ coarsely and denies more than it should.
 - With tracing: 16.0M ops/sec (-13%, negligible in HTTP workloads)
 - With metrics: 16.2M ops/sec (-12%, negligible in production)
 
-See [BENCHMARK_COMPARISON_v0.5.0.md](BENCHMARK_COMPARISON_v0.5.0.md) for detailed analysis across versions.
+Run `cargo bench --bench comparison` on your hardware rather than treating published microbench numbers as portable.
 
 **Key Insight**: This library excels at **per-key rate limiting** (separate limits per client), while libraries like `governor` are optimized for **global rate limiting** (single limit for all requests). Both have their use cases, and this library fills the per-key niche with excellent performance.
 
@@ -195,17 +195,17 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tokio-rate-limit = "0.8"
+tokio-rate-limit = "0.10"
 
 # For Axum middleware support
-tokio-rate-limit = { version = "0.8", features = ["middleware"] }
+tokio-rate-limit = { version = "0.10", features = ["middleware"] }
 
 # For Tonic gRPC middleware support
-tokio-rate-limit = { version = "0.8", features = ["tonic-support"] }
+tokio-rate-limit = { version = "0.10", features = ["tonic-support"] }
 
 # For observability (tracing + metrics)
-tokio-rate-limit = { version = "0.8", features = ["middleware", "observability"] }
-tokio-rate-limit = { version = "0.8", features = ["middleware", "metrics-support"] }
+tokio-rate-limit = { version = "0.10", features = ["middleware", "observability"] }
+tokio-rate-limit = { version = "0.10", features = ["middleware", "metrics-support"] }
 ```
 
 ### Basic Usage
@@ -223,7 +223,7 @@ async fn main() {
         .unwrap();
 
     // Check if a request should be allowed
-    let decision = limiter.check("client-123").await.unwrap();
+    let decision = limiter.check("client-123");
 
     if decision.permitted {
         // Process request
@@ -248,47 +248,21 @@ use tokio_rate_limit::RateLimiter;
 async fn main() {
     // Create probabilistic algorithm with 5% sampling (recommended)
     let algorithm = ProbabilisticTokenBucket::new(
-        100,  // capacity
+        2000, // capacity (>= 10 * sample_rate * cost)
         100,  // refill_rate per second
-        20    // sample_rate (5% = 1 in 20 requests)
+        20,   // sample_rate (1 in 20 requests)
     );
 
     let limiter = RateLimiter::from_algorithm(algorithm);
-
-    // Use exactly like regular TokenBucket
-    let decision = limiter.check("user-123").await.unwrap();
+    let decision = limiter.check("user-123");
 
     if decision.permitted {
-        println!("Request allowed! (probabilistic sampling)");
-        // 24.6% faster at 8 threads, <1% error margin
+        println!("Request allowed");
     }
 }
 ```
 
-**Recommended Configuration: 5% Sampling**
-- Best empirical performance (24.6% improvement at 8 threads)
-- <1% error margin
-- Optimal balance of speed and accuracy
-
-**Sampling Rate Guide:**
-- **1% (rate=100)**: Maximum performance (+29.6% cost-based), ~1-2% error
-- **5% (rate=20)**: Recommended - best overall (+24.6% at 8 threads), <1% error
-- **10% (rate=10)**: More accurate, modest gains (+8.1%), <0.5% error
-- **20% (rate=5)**: Minimal error, smaller gains, <0.2% error
-
-**When to use:**
-- ✅ Ultra-high throughput APIs (>1M req/sec)
-- ✅ DDoS protection and load shedding
-- ✅ Cost-based rate limiting
-- ✅ Multi-threaded hot-key scenarios
-
-**When NOT to use:**
-- ❌ Billing or metering (use TokenBucket for exact counts)
-- ❌ Strict compliance scenarios (regulatory requirements)
-- ❌ Low throughput (<1M req/sec) - overhead not worth it
-- ❌ Zero tolerance for over-limit requests
-
-See `benches/probabilistic_tradeoff.rs` for the accuracy/throughput benchmark and `examples/probabilistic_rate_limiting.rs` for usage examples. (`PROBABILISTIC_ANALYSIS.md` predates the 0.9.0 fix and its accuracy figures are not valid.)
+See the accuracy/throughput tables above, `benches/probabilistic_tradeoff.rs`, and `examples/probabilistic_rate_limiting.rs`. Keep `capacity >= 10 * sample_rate * cost`.
 
 ### Cost-Based Rate Limiting *(NEW in v0.2.0)*
 
@@ -302,10 +276,10 @@ let limiter = RateLimiter::builder()
     .unwrap();
 
 // Light operation - costs 1 token
-limiter.check_with_cost("user-123", 1).await?;
+limiter.check_with_cost("user-123", 1);
 
 // Heavy operation - costs 50 tokens
-limiter.check_with_cost("user-123", 50).await?;
+limiter.check_with_cost("user-123", 50);
 
 // Use cases:
 // - Simple queries: cost=1, Complex queries: cost=10
@@ -319,17 +293,17 @@ Wait for tokens to become available:
 
 ```rust
 // Block indefinitely until tokens available
-let decision = limiter.acquire("user-123").await?;
+let decision = limiter.acquire("user-123").await;
 
 // Block with timeout
 use std::time::Duration;
-let decision = limiter.acquire_timeout("user-123", Duration::from_secs(5)).await?;
+let decision = limiter.acquire_timeout("user-123", Duration::from_secs(5)).await;
 if !decision.permitted {
     println!("Timed out waiting for tokens");
 }
 
 // Non-blocking (original behavior)
-let decision = limiter.try_acquire("user-123").await?;
+let decision = limiter.try_acquire("user-123");
 ```
 
 ### Axum Middleware
@@ -482,7 +456,7 @@ GrpcRateLimitLayer::with_extractor(
 
 **Enable with feature flag:**
 ```toml
-tokio-rate-limit = { version = "0.5", features = ["tonic-support"] }
+tokio-rate-limit = { version = "0.10", features = ["tonic-support"] }
 ```
 
 ## Algorithms *(NEW in v0.3.0)*
@@ -599,10 +573,10 @@ Enable distributed tracing and metrics for production debugging:
 
 ```toml
 # Cargo.toml
-tokio-rate-limit = { version = "0.2", features = ["middleware", "observability"] }
+tokio-rate-limit = { version = "0.10", features = ["middleware", "observability"] }
 
 # For metrics collection
-tokio-rate-limit = { version = "0.2", features = ["middleware", "metrics-support"] }
+tokio-rate-limit = { version = "0.10", features = ["middleware", "metrics-support"] }
 ```
 
 ### Distributed Tracing
@@ -616,7 +590,7 @@ use tracing_subscriber;
 tracing_subscriber::fmt::init();
 
 // All rate limit checks now emit spans
-let decision = limiter.check("user-123").await?;
+let decision = limiter.check("user-123");
 
 // Span includes:
 // - key: "user-123"
@@ -769,22 +743,20 @@ Both libraries are excellent choices depending on your use case!
 
 Full API documentation is available at [docs.rs/tokio-rate-limit](https://docs.rs/tokio-rate-limit).
 
-## What's New in v0.8.0
+## What's New in v0.10.0
 
-- **Axum 0.8.6 Support**: Updated to latest Axum version for improved compatibility
-- **Zero Breaking Changes**: Fully backward compatible with v0.7.x
+- **`check()` is synchronous** and returns `RateLimitDecision` directly (no `Result`, no `.await`)
+- Shared `retry_after` math: sub-second waits are no longer `ceil()`'d to a full second
+- HTTP `Retry-After` / `RateLimit-Reset` round up to at least 1 second
+- Middleware fails closed when the key extractor returns `None`
+- `SimdTokenBucket` and `ZeroCopyTokenBucket` removed; `CachedTokenBucket` deprecated
+- `tonic-support` no longer requires `protoc`
 
-**Previous Releases:**
-- **v0.7.0**: Probabilistic rate limiting (experimental) with 24.6% multi-threaded improvement
-- **v0.6.0**: Micro-sharding (256 shards) for +90% multi-threaded scaling
-- **v0.5.0**: Tonic gRPC middleware with <300ns overhead
-- **v0.4.0**: Zero-copy optimization for +19% performance
-
-See [CHANGELOG.md](CHANGELOG.md) for complete release history and [PROBABILISTIC_ANALYSIS.md](PROBABILISTIC_ANALYSIS.md) for comprehensive v0.7.0 benchmarks.
+See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
 ## Minimum Supported Rust Version (MSRV)
 
-This crate requires Rust 1.75.0 or later.
+This crate requires Rust 1.85.0 or later (`tonic-support` needs 1.88).
 
 ## Performance Tips
 

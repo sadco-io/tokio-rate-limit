@@ -1,6 +1,10 @@
+[workspace]
+members = [".", "examples/grpc-hello"]
+default-members = ["."]
+
 [package]
 name = "tokio-rate-limit"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 # 1.85 is the floor for the default build and for `middleware`.
 # The `tonic-support` feature additionally requires 1.88 -- tonic,
@@ -16,9 +20,7 @@ categories = ["web-programming", "asynchronous", "network-programming"]
 readme = "README.md"
 include = [
     "src/**/*.rs",
-    "build.rs",
-    "proto/**/*.proto",
-    "README.md",
+    "/README.md",
     "CHANGELOG.md",
     "LICENSE-MIT",
     "LICENSE-APACHE",
@@ -27,7 +29,7 @@ include = [
 [features]
 default = []
 middleware = ["axum", "tower"]
-tonic-support = ["tonic", "tonic-prost", "prost", "tower", "http", "tonic-prost-build"]
+tonic-support = ["tonic", "tower", "http"]
 observability = ["tracing"]
 metrics-support = ["metrics", "observability"]
 
@@ -36,7 +38,6 @@ metrics-support = ["metrics", "observability"]
 tokio = { version = "1.53", features = ["sync", "time"] }
 
 # Concurrency primitives
-parking_lot = "0.12.5"
 flurry = "0.5.2"
 
 # Optional: Axum middleware
@@ -45,8 +46,6 @@ tower = { version = "0.5.3", optional = true }
 
 # Optional: Tonic gRPC middleware
 tonic = { version = "0.14.6", optional = true }
-tonic-prost = { version = "0.14.6", optional = true }
-prost = { version = "0.14.4", optional = true }
 http = { version = "1.5", optional = true }
 
 # Optional: Observability
@@ -55,9 +54,6 @@ metrics = { version = "0.24.6", optional = true }
 
 # Error handling
 thiserror = "2.0.20"
-
-# Utilities
-async-trait = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["full", "test-util"] }
@@ -83,18 +79,12 @@ dashmap = "6.2"
 papaya = "0.2.5"
 scc = "3.8"
 
-[build-dependencies]
-tonic-prost-build = { version = "0.14.6", optional = true }
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 # Examples and integration tests that need a non-default feature. Without
 # these, `cargo test` / `cargo build --examples` fail to resolve `tonic`.
-[[example]]
-name = "grpc_tonic"
-required-features = ["tonic-support"]
-
-[[example]]
-name = "grpc_tonic_client"
-required-features = ["tonic-support"]
 
 [[test]]
 name = "tonic_integration"

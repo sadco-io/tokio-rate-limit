@@ -54,7 +54,7 @@ async fn drive<A: Algorithm>(algorithm: &A, offered_per_sec: u64, keys: usize) -
     let mut allowed = 0u64;
     for i in 0..offered {
         let key = &key_names[(i as usize) % keys];
-        if algorithm.check(key).await.unwrap().permitted {
+        if algorithm.check(key).permitted {
             allowed += 1;
         }
         tokio::time::advance(interval).await;
@@ -204,7 +204,7 @@ fn single_thread(c: &mut Criterion) {
     group.bench_function("token_bucket_baseline", |b| {
         let bucket = TokenBucket::new(BENCH_CAPACITY, BENCH_RATE);
         b.to_async(&runtime)
-            .iter(|| async { black_box(bucket.check(black_box("hot-key")).await) });
+            .iter(|| async { black_box(bucket.check(black_box("hot-key"))) });
     });
 
     for sample_rate in SAMPLE_RATES {
@@ -214,7 +214,7 @@ fn single_thread(c: &mut Criterion) {
             |b, &sample_rate| {
                 let bucket = ProbabilisticTokenBucket::new(BENCH_CAPACITY, BENCH_RATE, sample_rate);
                 b.to_async(&runtime)
-                    .iter(|| async { black_box(bucket.check(black_box("hot-key")).await) });
+                    .iter(|| async { black_box(bucket.check(black_box("hot-key"))) });
             },
         );
     }
@@ -230,7 +230,7 @@ fn single_thread(c: &mut Criterion) {
             std::time::Duration::from_secs(3600),
         );
         b.to_async(&runtime)
-            .iter(|| async { black_box(bucket.check(black_box("hot-key")).await) });
+            .iter(|| async { black_box(bucket.check(black_box("hot-key"))) });
     });
     group.finish();
 }
@@ -256,7 +256,7 @@ fn deny_path(c: &mut Criterion) {
     group.bench_function("token_bucket_baseline", |b| {
         let bucket = TokenBucket::new(DENY_CAPACITY, DENY_RATE);
         b.to_async(&runtime)
-            .iter(|| async { black_box(bucket.check(black_box("hot-key")).await) });
+            .iter(|| async { black_box(bucket.check(black_box("hot-key"))) });
     });
 
     for sample_rate in [1u32, 100] {
@@ -266,7 +266,7 @@ fn deny_path(c: &mut Criterion) {
             |b, &sample_rate| {
                 let bucket = ProbabilisticTokenBucket::new(DENY_CAPACITY, DENY_RATE, sample_rate);
                 b.to_async(&runtime)
-                    .iter(|| async { black_box(bucket.check(black_box("hot-key")).await) });
+                    .iter(|| async { black_box(bucket.check(black_box("hot-key"))) });
             },
         );
     }
@@ -292,13 +292,7 @@ where
             let algorithm = Arc::clone(&algorithm);
             handles.push(tokio::spawn(async move {
                 for _ in 0..iterations {
-                    black_box(
-                        algorithm
-                            .check(black_box("hot-key"))
-                            .await
-                            .unwrap()
-                            .permitted,
-                    );
+                    black_box(algorithm.check(black_box("hot-key")).permitted);
                 }
             }));
         }
@@ -370,7 +364,7 @@ fn key_cardinality(c: &mut Criterion) {
                     index = index.wrapping_add(1);
                     let key = keys[index % keys.len()].clone();
                     let bucket = &bucket;
-                    async move { black_box(bucket.check(black_box(&key)).await) }
+                    async move { black_box(bucket.check(black_box(&key))) }
                 });
             },
         );
@@ -388,7 +382,7 @@ fn key_cardinality(c: &mut Criterion) {
                         index = index.wrapping_add(1);
                         let key = keys[index % keys.len()].clone();
                         let bucket = &bucket;
-                        async move { black_box(bucket.check(black_box(&key)).await) }
+                        async move { black_box(bucket.check(black_box(&key))) }
                     });
                 },
             );

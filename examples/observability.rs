@@ -48,7 +48,8 @@ async fn main() {
     let limiter = RateLimiter::new(RateLimiterConfig {
         requests_per_second: 10,
         burst: 20,
-    });
+    })
+    .unwrap();
 
     println!("Observability Demo");
     println!("Watch for trace spans and metrics as requests are processed\n");
@@ -57,30 +58,23 @@ async fn main() {
     for i in 1..=25 {
         let client = format!("client-{}", i % 3); // 3 different clients
 
-        match limiter.check(&client).await {
-            Ok(decision) if decision.permitted => {
-                #[cfg(feature = "observability")]
-                tracing::info!(
-                    client = %client,
-                    remaining = decision.remaining,
-                    "Request permitted"
-                );
-                println!("Request {} ({}): ✓ Permitted", i, client);
-            }
-            Ok(decision) => {
-                #[cfg(feature = "observability")]
-                tracing::warn!(
-                    client = %client,
-                    retry_after = ?decision.retry_after,
-                    "Request denied"
-                );
-                println!("Request {} ({}): ✗ Denied", i, client);
-            }
-            Err(e) => {
-                #[cfg(feature = "observability")]
-                tracing::error!(error = %e, "Rate limit check failed");
-                eprintln!("Request {}: Error: {}", i, e);
-            }
+        let decision = limiter.check(&client);
+        if decision.permitted {
+            #[cfg(feature = "observability")]
+            tracing::info!(
+                client = %client,
+                remaining = decision.remaining,
+                "Request permitted"
+            );
+            println!("Request {} ({}): Permitted", i, client);
+        } else {
+            #[cfg(feature = "observability")]
+            tracing::warn!(
+                client = %client,
+                retry_after = ?decision.retry_after,
+                "Request denied"
+            );
+            println!("Request {} ({}): Denied", i, client);
         }
 
         // Small delay between requests

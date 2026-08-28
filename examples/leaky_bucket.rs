@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Try to send 30 requests rapidly
     for i in 1..=30 {
-        let decision = token_limiter.check("client-1").await?;
+        let decision = token_limiter.check("client-1");
         if decision.permitted {
             allowed += 1;
             println!(
@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Try to send 30 requests rapidly
     for i in 1..=30 {
-        let decision = leaky_limiter.check("client-1").await?;
+        let decision = leaky_limiter.check("client-1");
         if decision.permitted {
             allowed += 1;
             println!(
@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     denied = 0;
 
     for i in 1..=20 {
-        let decision = leaky_limiter.check("client-2").await?;
+        let decision = leaky_limiter.check("client-2");
         if decision.permitted {
             allowed += 1;
             println!(
@@ -146,7 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Small requests (cost 10 each)
     println!("Sending 5 small requests (cost 10 each):");
     for i in 1..=5 {
-        let decision = leaky_limiter.check_with_cost("client-3", 10).await?;
+        let decision = leaky_limiter.check_with_cost("client-3", 10);
         println!(
             "  Request {}: {} (remaining capacity: {})",
             i,
@@ -157,7 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Large request (cost 60)
     println!("\nSending 1 large request (cost 60):");
-    let decision = leaky_limiter.check_with_cost("client-3", 60).await?;
+    let decision = leaky_limiter.check_with_cost("client-3", 60);
     println!(
         "  Large request: {} (remaining capacity: {})",
         if decision.permitted { "✓" } else { "✗" },

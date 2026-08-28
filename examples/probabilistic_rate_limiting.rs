@@ -26,7 +26,7 @@ async fn main() {
     let start = Instant::now();
     for i in 0..iterations {
         let key = format!("user-{}", i % 100);
-        let _ = baseline.check(&key).await;
+        let _ = baseline.check(&key);
     }
     let baseline_time = start.elapsed();
 
@@ -35,7 +35,7 @@ async fn main() {
     let start = Instant::now();
     for i in 0..iterations {
         let key = format!("user-{}", i % 100);
-        let _ = prob_1pct.check(&key).await;
+        let _ = prob_1pct.check(&key);
     }
     let prob_1pct_time = start.elapsed();
 
@@ -44,7 +44,7 @@ async fn main() {
     let start = Instant::now();
     for i in 0..iterations {
         let key = format!("user-{}", i % 100);
-        let _ = prob_5pct.check(&key).await;
+        let _ = prob_5pct.check(&key);
     }
     let prob_5pct_time = start.elapsed();
 
@@ -53,7 +53,7 @@ async fn main() {
     let start = Instant::now();
     for i in 0..iterations {
         let key = format!("user-{}", i % 100);
-        let _ = prob_10pct.check(&key).await;
+        let _ = prob_10pct.check(&key);
     }
     let prob_10pct_time = start.elapsed();
 
@@ -100,7 +100,7 @@ async fn main() {
     let mut allowed = 0;
     let mut denied = 0;
     for _ in 0..60 {
-        let decision = limiter.check("burst-user").await.unwrap();
+        let decision = limiter.check("burst-user");
         if decision.permitted {
             allowed += 1;
         } else {
@@ -119,7 +119,7 @@ async fn main() {
     denied = 0;
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(1) {
-        let decision = limiter.check("sustained-user").await.unwrap();
+        let decision = limiter.check("sustained-user");
         if decision.permitted {
             allowed += 1;
         } else {
@@ -149,10 +149,7 @@ async fn main() {
     ];
 
     for (model, cost) in &requests {
-        let decision = gpu_limiter
-            .check_with_cost("api-user", *cost)
-            .await
-            .unwrap();
+        let decision = gpu_limiter.check_with_cost("api-user", *cost);
         println!(
             "  {} (cost={}): {}",
             model,
@@ -174,7 +171,7 @@ async fn main() {
     println!("🔥 Scenario 4: Hot Key Workload (80/20 distribution)");
     println!("Simulating multi-tenant SaaS with popular users\n");
 
-    let saas_limiter = Arc::new(ProbabilisticTokenBucket::new(100, 50, 20)); // 5% sampling
+    let saas_limiter = Arc::new(ProbabilisticTokenBucket::new(2000, 50, 20));
 
     let iterations = 10_000;
     let start = Instant::now();
@@ -187,7 +184,7 @@ async fn main() {
             format!("cold-user-{}", i % 100) // Cold users
         };
 
-        let _ = saas_limiter.check(&user_id).await;
+        let _ = saas_limiter.check(&user_id);
     }
 
     let hot_key_time = start.elapsed();
@@ -217,7 +214,7 @@ async fn main() {
     let enterprise_tier = TokenBucket::new(5000, 1000);
 
     println!("  Free tier: no sampling (50 burst, 10/sec)");
-    let decision = free_tier.check("free-user").await.unwrap();
+    let decision = free_tier.check("free-user");
     println!(
         "    Status: {}, Remaining: {}",
         if decision.permitted {
@@ -229,7 +226,7 @@ async fn main() {
     );
 
     println!("\n  Pro tier: 10% sampling (500 burst, 100/sec)");
-    let decision = pro_tier.check("pro-user").await.unwrap();
+    let decision = pro_tier.check("pro-user");
     println!(
         "    Status: {}, Remaining: {}",
         if decision.permitted {
@@ -241,7 +238,7 @@ async fn main() {
     );
 
     println!("\n  Enterprise tier: Deterministic (5000 burst, 1000/sec)");
-    let decision = enterprise_tier.check("enterprise-user").await.unwrap();
+    let decision = enterprise_tier.check("enterprise-user");
     println!(
         "    Status: {}, Remaining: {}",
         if decision.permitted {

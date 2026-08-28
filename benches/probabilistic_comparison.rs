@@ -50,7 +50,7 @@ fn single_threaded_sampling_comparison(c: &mut Criterion) {
     group.bench_function("baseline_deterministic", |b| {
         let bucket = TokenBucket::new(1_000_000, 1_000_000);
         b.to_async(&rt).iter(|| async {
-            let result = bucket.check(black_box("test-key")).await;
+            let result = bucket.check(black_box("test-key"));
             black_box(result)
         });
     });
@@ -69,7 +69,7 @@ fn single_threaded_sampling_comparison(c: &mut Criterion) {
         group.bench_function(label, |b| {
             let bucket = ProbabilisticTokenBucket::new(1_000_000, 1_000_000, sample_rate);
             b.to_async(&rt).iter(|| async {
-                let result = bucket.check(black_box("test-key")).await;
+                let result = bucket.check(black_box("test-key"));
                 black_box(result)
             });
         });
@@ -111,7 +111,7 @@ fn multi_threaded_scaling(c: &mut Criterion) {
                             rt.block_on(async {
                                 for i in 0..iters {
                                     let key = format!("key-{}", i % 100);
-                                    let _ = black_box(bucket.check(black_box(&key)).await);
+                                    let _ = black_box(bucket.check(black_box(&key)));
                                 }
                             });
                             start.elapsed()
@@ -152,7 +152,7 @@ fn multi_threaded_scaling(c: &mut Criterion) {
                             rt.block_on(async {
                                 for i in 0..iters {
                                     let key = format!("key-{}", i % 100);
-                                    let _ = black_box(bucket.check(black_box(&key)).await);
+                                    let _ = black_box(bucket.check(black_box(&key)));
                                 }
                             });
                             start.elapsed()
@@ -193,7 +193,7 @@ fn multi_threaded_scaling(c: &mut Criterion) {
                             rt.block_on(async {
                                 for i in 0..iters {
                                     let key = format!("key-{}", i % 100);
-                                    let _ = black_box(bucket.check(black_box(&key)).await);
+                                    let _ = black_box(bucket.check(black_box(&key)));
                                 }
                             });
                             start.elapsed()
@@ -234,7 +234,7 @@ fn multi_threaded_scaling(c: &mut Criterion) {
                             rt.block_on(async {
                                 for i in 0..iters {
                                     let key = format!("key-{}", i % 100);
-                                    let _ = black_box(bucket.check(black_box(&key)).await);
+                                    let _ = black_box(bucket.check(black_box(&key)));
                                 }
                             });
                             start.elapsed()
@@ -281,7 +281,7 @@ fn key_cardinality_comparison(c: &mut Criterion) {
                     async move {
                         let idx = counter.fetch_add(1, Ordering::Relaxed);
                         let key = generate_key(idx, card, None);
-                        let result = bucket.check(black_box(&key)).await;
+                        let result = bucket.check(black_box(&key));
                         black_box(result)
                     }
                 });
@@ -302,7 +302,7 @@ fn key_cardinality_comparison(c: &mut Criterion) {
                     async move {
                         let idx = counter.fetch_add(1, Ordering::Relaxed);
                         let key = generate_key(idx, card, None);
-                        let result = bucket.check(black_box(&key)).await;
+                        let result = bucket.check(black_box(&key));
                         black_box(result)
                     }
                 });
@@ -323,7 +323,7 @@ fn key_cardinality_comparison(c: &mut Criterion) {
                     async move {
                         let idx = counter.fetch_add(1, Ordering::Relaxed);
                         let key = generate_key(idx, card, None);
-                        let result = bucket.check(black_box(&key)).await;
+                        let result = bucket.check(black_box(&key));
                         black_box(result)
                     }
                 });
@@ -353,7 +353,7 @@ fn hot_key_workload(c: &mut Criterion) {
             async move {
                 let idx = counter.fetch_add(1, Ordering::Relaxed);
                 let key = generate_key(idx, 1000, Some(0.8));
-                let result = bucket.check(black_box(&key)).await;
+                let result = bucket.check(black_box(&key));
                 black_box(result)
             }
         });
@@ -370,7 +370,7 @@ fn hot_key_workload(c: &mut Criterion) {
             async move {
                 let idx = counter.fetch_add(1, Ordering::Relaxed);
                 let key = generate_key(idx, 1000, Some(0.8));
-                let result = bucket.check(black_box(&key)).await;
+                let result = bucket.check(black_box(&key));
                 black_box(result)
             }
         });
@@ -387,7 +387,7 @@ fn hot_key_workload(c: &mut Criterion) {
             async move {
                 let idx = counter.fetch_add(1, Ordering::Relaxed);
                 let key = generate_key(idx, 1000, Some(0.8));
-                let result = bucket.check(black_box(&key)).await;
+                let result = bucket.check(black_box(&key));
                 black_box(result)
             }
         });
@@ -404,7 +404,7 @@ fn hot_key_workload(c: &mut Criterion) {
             async move {
                 let idx = counter.fetch_add(1, Ordering::Relaxed);
                 let key = generate_key(idx, 1000, Some(0.8));
-                let result = bucket.check(black_box(&key)).await;
+                let result = bucket.check(black_box(&key));
                 black_box(result)
             }
         });
@@ -424,7 +424,7 @@ fn cost_based_comparison(c: &mut Criterion) {
     group.bench_function("baseline_cost_10", |b| {
         let bucket = TokenBucket::new(1_000_000, 1_000_000);
         b.to_async(&rt).iter(|| async {
-            let result = bucket.check_with_cost(black_box("test-key"), 10).await;
+            let result = bucket.check_with_cost(black_box("test-key"), 10);
             black_box(result)
         });
     });
@@ -433,7 +433,7 @@ fn cost_based_comparison(c: &mut Criterion) {
     group.bench_function("prob_1pct_cost_10", |b| {
         let bucket = ProbabilisticTokenBucket::new(1_000_000, 1_000_000, 100);
         b.to_async(&rt).iter(|| async {
-            let result = bucket.check_with_cost(black_box("test-key"), 10).await;
+            let result = bucket.check_with_cost(black_box("test-key"), 10);
             black_box(result)
         });
     });
@@ -442,7 +442,7 @@ fn cost_based_comparison(c: &mut Criterion) {
     group.bench_function("prob_10pct_cost_10", |b| {
         let bucket = ProbabilisticTokenBucket::new(1_000_000, 1_000_000, 10);
         b.to_async(&rt).iter(|| async {
-            let result = bucket.check_with_cost(black_box("test-key"), 10).await;
+            let result = bucket.check_with_cost(black_box("test-key"), 10);
             black_box(result)
         });
     });
@@ -462,7 +462,7 @@ fn extreme_throughput_single_key(c: &mut Criterion) {
     group.bench_function("baseline", |b| {
         let bucket = TokenBucket::new(1_000_000, 1_000_000);
         b.to_async(&rt).iter(|| async {
-            let result = bucket.check(black_box("hot-key")).await;
+            let result = bucket.check(black_box("hot-key"));
             black_box(result)
         });
     });
@@ -470,7 +470,7 @@ fn extreme_throughput_single_key(c: &mut Criterion) {
     group.bench_function("prob_1pct", |b| {
         let bucket = ProbabilisticTokenBucket::new(1_000_000, 1_000_000, 100);
         b.to_async(&rt).iter(|| async {
-            let result = bucket.check(black_box("hot-key")).await;
+            let result = bucket.check(black_box("hot-key"));
             black_box(result)
         });
     });
@@ -478,7 +478,7 @@ fn extreme_throughput_single_key(c: &mut Criterion) {
     group.bench_function("prob_5pct", |b| {
         let bucket = ProbabilisticTokenBucket::new(1_000_000, 1_000_000, 20);
         b.to_async(&rt).iter(|| async {
-            let result = bucket.check(black_box("hot-key")).await;
+            let result = bucket.check(black_box("hot-key"));
             black_box(result)
         });
     });
@@ -486,7 +486,7 @@ fn extreme_throughput_single_key(c: &mut Criterion) {
     group.bench_function("prob_10pct", |b| {
         let bucket = ProbabilisticTokenBucket::new(1_000_000, 1_000_000, 10);
         b.to_async(&rt).iter(|| async {
-            let result = bucket.check(black_box("hot-key")).await;
+            let result = bucket.check(black_box("hot-key"));
             black_box(result)
         });
     });

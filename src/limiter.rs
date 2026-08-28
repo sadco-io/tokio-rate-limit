@@ -152,11 +152,15 @@ impl RateLimiterBuilder {
 
         config.validate()?;
 
-        Ok(RateLimiter::new(config))
+        RateLimiter::new(config)
     }
 }
 
 /// Result of a rate limit check.
+///
+/// `check` consumes quota when it returns `permitted: true`. Ignoring the
+/// decision is almost always a bug.
+#[must_use]
 #[derive(Debug, Clone)]
 pub struct RateLimitDecision {
     /// Whether the request is permitted.
@@ -177,12 +181,17 @@ pub struct RateLimitDecision {
 }
 
 /// A rate limiter that tracks requests per key and enforces limits.
-pub struct RateLimiter {
-    algorithm: Box<dyn Algorithm>,
+pub struct RateLimiter<A: Algorithm = TokenBucket> {
+    algorithm: A,
 }
 
-impl RateLimiter {
-    /// Creates a new rate limiter with the given configuration.
+impl RateLimiter<TokenBucket> {
+    /// Creates a new token-bucket rate limiter with the given configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`](crate::error::Error::Config) if `requests_per_second`
+    /// or `burst` is 0, or if `burst < requests_per_second`.
     ///
     /// # Examples
     ///
@@ -192,36 +201,17 @@ impl RateLimiter {
     /// let limiter = RateLimiter::new(RateLimiterConfig {
     ///     requests_per_second: 100,
     ///     burst: 200,
-    /// });
+    /// })
+    /// .unwrap();
     /// ```
-    pub fn new(config: RateLimiterConfig) -> Self {
-        Self {
-            algorithm: Box::new(TokenBucket::new(config.burst, config.requests_per_second)),
-        }
+    pub fn new(config: RateLimiterConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            algorithm: TokenBucket::new(config.burst, config.requests_per_second),
+        })
     }
 
-    /// Creates a new rate limiter with a custom algorithm.
-    ///
-    /// This allows you to use alternative algorithms like [`LeakyBucket`](crate::algorithm::LeakyBucket)
-    /// instead of the default [`TokenBucket`](crate::algorithm::TokenBucket).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use tokio_rate_limit::RateLimiter;
-    /// use tokio_rate_limit::algorithm::LeakyBucket;
-    ///
-    /// // Create a leaky bucket with capacity 50, leak rate 100/sec
-    /// let algorithm = LeakyBucket::new(50, 100);
-    /// let limiter = RateLimiter::from_algorithm(algorithm);
-    /// ```
-    pub fn from_algorithm<A: Algorithm + 'static>(algorithm: A) -> Self {
-        Self {
-            algorithm: Box::new(algorithm),
-        }
-    }
-
-    /// Creates a new builder for configuring a rate limiter.
+    /// Creates a new builder for configuring a token-bucket rate limiter.
     ///
     /// # Examples
     ///
@@ -237,7 +227,41 @@ impl RateLimiter {
     pub fn builder() -> RateLimiterBuilder {
         RateLimiterBuilder::new()
     }
+}
 
+impl<A: Algorithm> RateLimiter<A> {
+    /// Creates a new rate limiter with a custom algorithm.
+    ///
+    /// This allows you to use alternative algorithms like [`LeakyBucket`](crate::algorithm::LeakyBucket)
+    /// instead of the default [`TokenBucket`](crate::algorithm::TokenBucket).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tokio_rate_limit::RateLimiter;
+    /// use tokio_rate_limit::algorithm::LeakyBucket;
+    ///
+    /// // Create a leaky bucket with capacity 50, leak rate 100/sec
+    /// let algorithm = LeakyBucket::new(50, 100);
+    /// let limiter = RateLimiter::from_algorithm(algorithm);
+    /// ```
+    pub fn from_algorithm(algorithm: A) -> Self {
+        Self { algorithm }
+    }
+
+    /// Creates a new builder for configuring a rate limiter.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tokio_rate_limit::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::builder()
+    ///     .requests_per_second(100)
+    ///     .burst(200)
+    ///     .build()
+    ///     .unwrap();
+    /// ```
     /// Checks if a request for the given key should be permitted.
     ///
     /// # Arguments
@@ -251,25 +275,24 @@ impl RateLimiter {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// # use tokio_rate_limit::{RateLimiter, RateLimiterConfig};
-    /// # async fn example() {
     /// let limiter = RateLimiter::new(RateLimiterConfig {
     ///     requests_per_second: 100,
     ///     burst: 200,
-    /// });
+    /// })
+    /// .unwrap();
     ///
-    /// let decision = limiter.check("client-123").await.unwrap();
+    /// let decision = limiter.check("client-123");
     /// if decision.permitted {
     ///     // Process the request
     /// } else {
     ///     // Reject with 429 Too Many Requests
     /// }
-    /// # }
     /// ```
     #[cfg_attr(feature = "observability", instrument(skip(self), fields(key = %key)))]
-    pub async fn check(&self, key: &str) -> Result<RateLimitDecision> {
-        let decision = self.algorithm.check(key).await?;
+    pub fn check(&self, key: &str) -> RateLimitDecision {
+        let decision = self.algorithm.check(key);
 
         #[cfg(feature = "observability")]
         {
@@ -289,7 +312,7 @@ impl RateLimiter {
             }
         }
 
-        Ok(decision)
+        decision
     }
 
     /// Checks if a request with the given cost should be permitted.
@@ -309,24 +332,23 @@ impl RateLimiter {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// # use tokio_rate_limit::{RateLimiter, RateLimiterConfig};
-    /// # async fn example() {
     /// let limiter = RateLimiter::new(RateLimiterConfig {
     ///     requests_per_second: 100,
     ///     burst: 200,
-    /// });
+    /// })
+    /// .unwrap();
     ///
     /// // Light operation costs 1 token
-    /// let decision = limiter.check_with_cost("client-123", 1).await.unwrap();
+    /// let decision = limiter.check_with_cost("client-123", 1);
     ///
     /// // Heavy operation costs 10 tokens
-    /// let decision = limiter.check_with_cost("client-123", 10).await.unwrap();
-    /// # }
+    /// let decision = limiter.check_with_cost("client-123", 10);
     /// ```
     #[cfg_attr(feature = "observability", instrument(skip(self), fields(key = %key, cost = cost)))]
-    pub async fn check_with_cost(&self, key: &str, cost: u64) -> Result<RateLimitDecision> {
-        let decision = self.algorithm.check_with_cost(key, cost).await?;
+    pub fn check_with_cost(&self, key: &str, cost: u64) -> RateLimitDecision {
+        let decision = self.algorithm.check_with_cost(key, cost);
 
         #[cfg(feature = "observability")]
         {
@@ -348,7 +370,7 @@ impl RateLimiter {
             }
         }
 
-        Ok(decision)
+        decision
     }
 
     /// Try to acquire permission without blocking.
@@ -368,16 +390,16 @@ impl RateLimiter {
     /// let limiter = RateLimiter::new(RateLimiterConfig {
     ///     requests_per_second: 100,
     ///     burst: 200,
-    /// });
+    /// }).unwrap();
     ///
-    /// let decision = limiter.try_acquire("client-123").await.unwrap();
+    /// let decision = limiter.try_acquire("client-123");
     /// if decision.permitted {
     ///     // Process the request
     /// }
     /// # }
     /// ```
-    pub async fn try_acquire(&self, key: &str) -> Result<RateLimitDecision> {
-        self.check(key).await
+    pub fn try_acquire(&self, key: &str) -> RateLimitDecision {
+        self.check(key)
     }
 
     /// Try to acquire permission with a specific cost.
@@ -397,13 +419,13 @@ impl RateLimiter {
     /// let limiter = RateLimiter::new(RateLimiterConfig {
     ///     requests_per_second: 100,
     ///     burst: 200,
-    /// });
+    /// }).unwrap();
     ///
-    /// let decision = limiter.try_acquire_n("client-123", 5).await.unwrap();
+    /// let decision = limiter.try_acquire_n("client-123", 5);
     /// # }
     /// ```
-    pub async fn try_acquire_n(&self, key: &str, cost: u64) -> Result<RateLimitDecision> {
-        self.check_with_cost(key, cost).await
+    pub fn try_acquire_n(&self, key: &str, cost: u64) -> RateLimitDecision {
+        self.check_with_cost(key, cost)
     }
 
     /// Acquire permission, blocking until tokens are available or timeout.
@@ -426,13 +448,12 @@ impl RateLimiter {
     /// let limiter = RateLimiter::new(RateLimiterConfig {
     ///     requests_per_second: 100,
     ///     burst: 200,
-    /// });
+    /// }).unwrap();
     ///
     /// // Wait up to 5 seconds for tokens
     /// let decision = limiter
     ///     .acquire_timeout("client-123", Duration::from_secs(5))
-    ///     .await
-    ///     .unwrap();
+    ///     .await;
     ///
     /// if decision.permitted {
     ///     // Process the request
@@ -440,26 +461,25 @@ impl RateLimiter {
     /// # }
     /// ```
     #[cfg_attr(feature = "observability", instrument(skip(self), fields(key = %key, timeout_ms = timeout.as_millis())))]
-    pub async fn acquire_timeout(&self, key: &str, timeout: Duration) -> Result<RateLimitDecision> {
+    pub async fn acquire_timeout(&self, key: &str, timeout: Duration) -> RateLimitDecision {
         let start = tokio::time::Instant::now();
 
         loop {
-            let decision = self.check(key).await?;
+            let decision = self.check(key);
 
             if decision.permitted {
                 #[cfg(feature = "observability")]
                 debug!("Acquired tokens after waiting");
-                return Ok(decision);
+                return decision;
             }
 
             let elapsed = start.elapsed();
             if elapsed >= timeout {
                 #[cfg(feature = "observability")]
                 info!("Timeout expired while waiting for tokens");
-                return Ok(decision); // Return denied decision
+                return decision;
             }
 
-            // Sleep for retry_after or a small amount
             let sleep_time = decision
                 .retry_after
                 .unwrap_or(Duration::from_millis(10))
@@ -486,23 +506,23 @@ impl RateLimiter {
     /// let limiter = RateLimiter::new(RateLimiterConfig {
     ///     requests_per_second: 100,
     ///     burst: 200,
-    /// });
+    /// }).unwrap();
     ///
     /// // Wait indefinitely for tokens
-    /// let decision = limiter.acquire("client-123").await.unwrap();
+    /// let decision = limiter.acquire("client-123").await;
     /// // Will always be permitted when this returns
     /// assert!(decision.permitted);
     /// # }
     /// ```
     #[cfg_attr(feature = "observability", instrument(skip(self), fields(key = %key)))]
-    pub async fn acquire(&self, key: &str) -> Result<RateLimitDecision> {
+    pub async fn acquire(&self, key: &str) -> RateLimitDecision {
         loop {
-            let decision = self.check(key).await?;
+            let decision = self.check(key);
 
             if decision.permitted {
                 #[cfg(feature = "observability")]
                 debug!("Acquired tokens");
-                return Ok(decision);
+                return decision;
             }
 
             // Sleep for retry_after or a small amount

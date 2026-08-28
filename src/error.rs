@@ -5,17 +5,9 @@ use thiserror::Error;
 /// Error types that can occur during rate limiting operations.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// Rate limit has been exceeded for the given key.
-    #[error("Rate limit exceeded")]
-    RateLimitExceeded,
-
     /// Configuration error.
     #[error("Configuration error: {0}")]
     Config(String),
-
-    /// An internal error occurred.
-    #[error("Internal error: {0}")]
-    InternalError(String),
 }
 
 /// A specialized Result type for rate limiting operations.

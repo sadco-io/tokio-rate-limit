@@ -18,7 +18,8 @@ async fn main() {
     let limiter = RateLimiter::new(RateLimiterConfig {
         requests_per_second: 10,
         burst: 15,
-    });
+    })
+    .unwrap();
 
     println!("Configuration: 10 requests/second, burst capacity: 15\n");
 
@@ -34,25 +35,19 @@ async fn main() {
     // Make a burst of requests
     println!("Making 20 requests rapidly...\n");
     for i in 1..=20 {
-        match limiter.check(client_id).await {
-            Ok(decision) => {
-                if decision.permitted {
-                    println!(
-                        "Request {}: ✓ ALLOWED (remaining: {})",
-                        i,
-                        decision.remaining.unwrap_or(0)
-                    );
-                } else {
-                    println!(
-                        "Request {}: ✗ RATE LIMITED (retry after: {:?})",
-                        i,
-                        decision.retry_after.unwrap()
-                    );
-                }
-            }
-            Err(e) => {
-                println!("Request {}: ERROR: {}", i, e);
-            }
+        let decision = limiter.check(client_id);
+        if decision.permitted {
+            println!(
+                "Request {}: ALLOWED (remaining: {})",
+                i,
+                decision.remaining.unwrap_or(0)
+            );
+        } else {
+            println!(
+                "Request {}: RATE LIMITED (retry after: {:?})",
+                i,
+                decision.retry_after.unwrap()
+            );
         }
     }
 
@@ -62,25 +57,19 @@ async fn main() {
 
     println!("Making 5 more requests...\n");
     for i in 21..=25 {
-        match limiter.check(client_id).await {
-            Ok(decision) => {
-                if decision.permitted {
-                    println!(
-                        "Request {}: ✓ ALLOWED (remaining: {})",
-                        i,
-                        decision.remaining.unwrap_or(0)
-                    );
-                } else {
-                    println!(
-                        "Request {}: ✗ RATE LIMITED (retry after: {:?})",
-                        i,
-                        decision.retry_after.unwrap()
-                    );
-                }
-            }
-            Err(e) => {
-                println!("Request {}: ERROR: {}", i, e);
-            }
+        let decision = limiter.check(client_id);
+        if decision.permitted {
+            println!(
+                "Request {}: ALLOWED (remaining: {})",
+                i,
+                decision.remaining.unwrap_or(0)
+            );
+        } else {
+            println!(
+                "Request {}: RATE LIMITED (retry after: {:?})",
+                i,
+                decision.retry_after.unwrap()
+            );
         }
     }
 
@@ -98,7 +87,7 @@ async fn main() {
     // Client 1 exhausts their limit
     println!("Client 1:");
     for i in 1..=3 {
-        let decision = limiter.check("client-1").await.unwrap();
+        let decision = limiter.check("client-1");
         println!(
             "  Request {}: {}",
             i,
@@ -113,7 +102,7 @@ async fn main() {
     // Client 2 has their own limit
     println!("\nClient 2:");
     for i in 1..=3 {
-        let decision = limiter.check("client-2").await.unwrap();
+        let decision = limiter.check("client-2");
         println!(
             "  Request {}: {}",
             i,

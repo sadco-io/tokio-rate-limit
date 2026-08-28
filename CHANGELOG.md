@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-28
+
+Breaking correctness and API cleanup. The 0.9.0 sampler rewrite was right;
+sibling algorithms, HTTP headers, and the `check()` surface still behaved
+like 0.8.0.
+
+### Breaking
+
+- `Algorithm::check` / `check_with_cost` and `RateLimiter::check` /
+  `check_with_cost` / `try_acquire` / `try_acquire_n` are **synchronous** and
+  return `RateLimitDecision` directly. There is no `Result` on the hot path
+  (denies are `permitted: false`). `.await` and `.unwrap()` on `check()` no
+  longer compile. `acquire` / `acquire_timeout` remain async because they sleep.
+- `RateLimiter` is generic over the algorithm (`RateLimiter<A = TokenBucket>`).
+  `from_algorithm` no longer boxes a trait object.
+- `RateLimiter::new` returns `Result` and validates the same invariants as the
+  builder (`rps > 0`, `burst > 0`, `burst >= rps`).
+- `cost == 0` is rejected without consuming quota.
+- Axum / Tonic middleware **fail closed** (429 / `RESOURCE_EXHAUSTED`) when the
+  key extractor returns `None`. Call `.fail_open()` to restore 0.9.x pass-through.
+  `IpKeyExtractor` requires `into_make_service_with_connect_info`.
+- Tonic `IpKeyExtractor` uses the last `x-forwarded-for` hop, not the first.
+- `SimdTokenBucket` and `ZeroCopyTokenBucket` are removed.
+- `CachedTokenBucket` is deprecated (removal planned for 0.11).
+- `Error::RateLimitExceeded` and `Error::InternalError` are removed.
+- `async-trait` and `parking_lot` are gone. `tonic-support` no longer pulls
+  `prost` / `tonic-prost` / `tonic-prost-build`, and the library no longer
+  compiles `proto/helloworld.proto` (so `protoc` is not required). The gRPC
+  greeter demo lives in `examples/grpc-hello`.
+- `RateLimitDecision` is `#[must_use]`.
+
+### Fixed
+
+- `retry_after` no longer uses `ceil()` on Probabilistic / Cached (the 0.8.1
+  TokenBucket fix, applied everywhere). At 10 tok/s a deny waits ~100ms, not 1s.
+- HTTP `Retry-After` and `RateLimit-Reset` serialize with
+  `ceil(duration).max(1)` so a 100ms wait is `1`, not `0`.
+- TokenBucket / LeakyBucket / Cached refill now **claims the interval before
+  crediting**, so a spurious `compare_exchange_weak` failure on ARM cannot
+  double-credit.
+- LeakyBucket lookups use the borrowed key (no `to_string()` on the hit path).
+- TTL cleanup is RNG-sampled (~1% of requests), not `now_nanos % 100 == 0`.
+- CachedTokenBucket skips the thread-local cache when `idle_ttl` is set, so
+  TTL eviction cannot split-brain a ghost `Arc`.
+
+### Added
+
+- Shared integer refill helpers used by every in-tree algorithm.
+- `tests/algo_shapes.rs` matrix: burst/deny, fractional `retry_after`, cost=0,
+  key isolation, refill, concurrent probabilistic bound, `new()` validation.
+- Contended TokenBucket refill test on a paused clock.
+- Middleware tests for `Retry-After: 1` and fail-closed / fail-open.
+- `[package.metadata.docs.rs] all-features = true`.
+
 ## [0.9.1] - 2026-08-26
 
 Dev-dependency maintenance only. Nothing in the published crate changed --

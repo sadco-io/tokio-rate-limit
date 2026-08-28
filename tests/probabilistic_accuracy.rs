@@ -24,7 +24,7 @@ async fn measure_throughput<A: Algorithm>(
     let interval = Duration::from_secs_f64(1.0 / target_rate as f64);
 
     while tokio::time::Instant::now() < end {
-        let decision = algorithm.check(key).await.unwrap();
+        let decision = algorithm.check(key);
         if decision.permitted {
             allowed += 1;
         } else {
@@ -182,7 +182,7 @@ async fn test_burst_capacity() {
     // Should allow burst of 50
     let mut allowed = 0;
     for _ in 0..60 {
-        let decision = prob.check("test-key").await.unwrap();
+        let decision = prob.check("test-key");
         if decision.permitted {
             allowed += 1;
         }
@@ -302,12 +302,12 @@ async fn test_refill_accuracy() {
 
     // Exhaust the bucket
     for _ in 0..10 {
-        let decision = prob.check("test-key").await.unwrap();
+        let decision = prob.check("test-key");
         assert!(decision.permitted);
     }
 
     // Next should be denied
-    let decision = prob.check("test-key").await.unwrap();
+    let decision = prob.check("test-key");
     assert!(!decision.permitted);
 
     // Wait 1 second (should refill 10 tokens)
@@ -316,7 +316,7 @@ async fn test_refill_accuracy() {
     // Should allow ~10 more requests
     let mut allowed = 0;
     for _ in 0..15 {
-        let decision = prob.check("test-key").await.unwrap();
+        let decision = prob.check("test-key");
         if decision.permitted {
             allowed += 1;
         }
@@ -341,14 +341,14 @@ async fn test_key_isolation() {
 
     // Exhaust key1
     for _ in 0..10 {
-        prob.check("key1").await.unwrap();
+        let _ = prob.check("key1");
     }
 
-    let decision1 = prob.check("key1").await.unwrap();
+    let decision1 = prob.check("key1");
     assert!(!decision1.permitted, "key1 should be rate limited");
 
     // key2 should still work
-    let decision2 = prob.check("key2").await.unwrap();
+    let decision2 = prob.check("key2");
     assert!(decision2.permitted, "key2 should not be rate limited");
 }
 
@@ -362,19 +362,19 @@ async fn test_cost_based_accuracy() {
 
     // Consume with costs: 30, 30, 30
     for _ in 0..3 {
-        let decision = prob.check_with_cost("test-key", 30).await.unwrap();
+        let decision = prob.check_with_cost("test-key", 30);
         assert!(decision.permitted);
     }
 
     // Should have ~10 tokens left
-    let decision = prob.check_with_cost("test-key", 30).await.unwrap();
+    let decision = prob.check_with_cost("test-key", 30);
     assert!(
         !decision.permitted,
         "Should not have enough tokens for cost=30"
     );
 
     // But should work with cost=10
-    let decision = prob.check_with_cost("test-key", 10).await.unwrap();
+    let decision = prob.check_with_cost("test-key", 10);
     assert!(decision.permitted, "Should have enough tokens for cost=10");
 }
 

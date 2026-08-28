@@ -37,7 +37,7 @@ async fn drive<A: Algorithm>(
 
     let mut allowed = 0u64;
     for _ in 0..offered {
-        if algorithm.check(key).await.unwrap().permitted {
+        if algorithm.check(key).permitted {
             allowed += 1;
         }
         tokio::time::advance(interval).await;
@@ -171,7 +171,7 @@ async fn stats_burst_cap() {
             let key = format!("burst-{sample_rate}-{run}");
             let mut allowed = 0i64;
             for _ in 0..BURST {
-                if bucket.check(&key).await.unwrap().permitted {
+                if bucket.check(&key).permitted {
                     allowed += 1;
                 }
             }
@@ -215,7 +215,7 @@ async fn idle_refill_is_seen_by_unsampled_requests() {
 
         // Drain to (at least) empty.
         for _ in 0..20_000 {
-            bucket.check(key).await.unwrap();
+            let _ = bucket.check(key);
         }
 
         // Idle long enough to refill to capacity.
@@ -225,7 +225,7 @@ async fn idle_refill_is_seen_by_unsampled_requests() {
         // next sampled request happens to credit the refill.
         let mut allowed = 0u64;
         for _ in 0..(CAP as usize) {
-            if bucket.check(key).await.unwrap().permitted {
+            if bucket.check(key).permitted {
                 allowed += 1;
             }
         }
