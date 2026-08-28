@@ -3,6 +3,7 @@
 ## Build
 
 ```bash
+cargo test --lib --tests --examples
 cargo test --all-features --lib --tests --examples
 cargo test --all-features --doc
 cargo clippy --all-features --lib --tests --examples -- -D warnings
