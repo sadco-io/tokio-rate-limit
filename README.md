@@ -114,7 +114,11 @@ skipped, and the hash map lookup dominates. Measured on aarch64/WSL2 with
 | single thread, 1000 keys | 4.85 Mops/s | 4.77 Mops/s | -1.6% |
 
 Absolute numbers are machine-specific; the ratios are the point. Run the bench
-on your own hardware before choosing this type over `TokenBucket`.
+on your own hardware before choosing this type over `TokenBucket`. On a Zipf-1.2
+10k-user keyspace the admit-always microbench is still ~1.6× at `sample_rate =
+100` versus `TokenBucket`; under the documented per-user shape (100 rps, burst
+200) the limiter is not the CPU constraint. `cargo bench --bench
+probabilistic_tradeoff` prints a per-decile fairness table against real quotas.
 
 **Sizing.** A sampled request debits a whole `sample_rate * cost` lump, so keep
 `capacity >= 10 * sample_rate * cost`. Below that the bucket is corrected too
