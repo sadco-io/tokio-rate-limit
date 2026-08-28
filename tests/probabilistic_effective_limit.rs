@@ -42,7 +42,7 @@ async fn burst_is_capped_at_capacity_for_every_sample_rate() {
 
         let mut allowed = 0u64;
         for _ in 0..BURST {
-            if bucket.check("burst-key").await.unwrap().permitted {
+            if bucket.check("burst-key").permitted {
                 allowed += 1;
             }
         }
@@ -89,7 +89,7 @@ async fn drive<A: Algorithm>(
 
     let mut allowed = 0u64;
     for _ in 0..offered {
-        if algorithm.check(key).await.unwrap().permitted {
+        if algorithm.check(key).permitted {
             allowed += 1;
         }
         tokio::time::advance(interval).await;

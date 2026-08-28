@@ -1,18 +1,15 @@
 //! Token bucket rate limiting algorithm implementation.
 
+use crate::algorithm::internal::{
+    nanos_for_tokens, refill_tokens, should_cleanup, token_decision, zero_cost_decision, SCALE,
+};
 use crate::algorithm::Algorithm;
-use crate::error::Result;
 use crate::limiter::RateLimitDecision;
-use async_trait::async_trait;
 use flurry::HashMap as FlurryHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
-
-/// Scaling factor for sub-token precision.
-/// Token counts are multiplied by this value to allow fractional tokens.
-const SCALE: u64 = 1000;
 
 /// Maximum burst capacity to prevent overflow in scaled arithmetic.
 /// This is u64::MAX / (2 * SCALE) to leave room for intermediate calculations.
@@ -77,103 +74,64 @@ impl AtomicTokenState {
         now_nanos: u64,
         cost: u64,
     ) -> (bool, u64) {
-        // Update last access time (for TTL tracking)
         self.last_access_nanos.store(now_nanos, Ordering::Relaxed);
 
-        // Scale capacity and cost for precision (using saturating to prevent overflow)
         let scaled_capacity = capacity.saturating_mul(SCALE);
         let token_cost = cost.saturating_mul(SCALE);
+        let rate_scaled = refill_rate_per_second.saturating_mul(SCALE);
+
+        self.apply_refill(scaled_capacity, rate_scaled, now_nanos);
 
         loop {
-            // Load current state
-            let current_tokens = self.tokens.load(Ordering::Relaxed);
-            let last_refill = self.last_refill_nanos.load(Ordering::Relaxed);
-
-            // Calculate elapsed time and tokens to refill
-            let elapsed_nanos = now_nanos.saturating_sub(last_refill);
-            let elapsed_secs = elapsed_nanos as f64 / 1_000_000_000.0;
-
-            // Calculate new tokens to add (scaled by SCALE)
-            // Using saturating_mul and as u64 truncation to prevent overflow
-            let tokens_per_sec_scaled = refill_rate_per_second.saturating_mul(SCALE);
-            let new_tokens_to_add = (elapsed_secs * tokens_per_sec_scaled as f64) as u64;
-
-            // Calculate updated token count, capped at capacity
-            let updated_tokens = current_tokens
-                .saturating_add(new_tokens_to_add)
-                .min(scaled_capacity);
-
-            // Try to consume the requested cost
-
-            if updated_tokens >= token_cost {
-                // We have enough tokens, try to consume
-                let new_tokens = updated_tokens.saturating_sub(token_cost);
-                let new_time = if new_tokens_to_add > 0 {
-                    now_nanos
-                } else {
-                    last_refill
-                };
-
-                // Try to update both tokens and time atomically via CAS
-                // Use compare_exchange_weak in retry loops for better performance on ARM
-                // First update tokens
-                match self.tokens.compare_exchange_weak(
-                    current_tokens,
-                    new_tokens,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        // Successfully updated tokens, now update time if needed
-                        if new_tokens_to_add > 0 {
-                            // Use compare_exchange_weak to update time, but don't fail if it changed
-                            // (another thread may have updated it, which is fine)
-                            let _ = self.last_refill_nanos.compare_exchange_weak(
-                                last_refill,
-                                new_time,
-                                Ordering::AcqRel,
-                                Ordering::Relaxed,
-                            );
-                        }
-                        return (true, new_tokens / SCALE);
-                    }
-                    Err(_) => {
-                        // Another thread modified the tokens, or spurious failure, retry
-                        continue;
-                    }
-                }
-            } else {
-                // Not enough tokens, update state for refill tracking but don't consume
-                let new_time = if new_tokens_to_add > 0 {
-                    now_nanos
-                } else {
-                    last_refill
-                };
-
-                // Try to update the state to reflect refill without consuming
-                match self.tokens.compare_exchange_weak(
-                    current_tokens,
-                    updated_tokens,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        if new_tokens_to_add > 0 {
-                            let _ = self.last_refill_nanos.compare_exchange_weak(
-                                last_refill,
-                                new_time,
-                                Ordering::AcqRel,
-                                Ordering::Relaxed,
-                            );
-                        }
-                        return (false, updated_tokens / SCALE);
-                    }
-                    Err(_) => {
-                        // Another thread modified it, or spurious failure, retry
-                        continue;
-                    }
-                }
+            let current = self.tokens.load(Ordering::Relaxed);
+            if current < token_cost {
+                return (false, current / SCALE);
             }
+            match self.tokens.compare_exchange_weak(
+                current,
+                current - token_cost,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(prev) => return (true, (prev - token_cost) / SCALE),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Claim the elapsed interval, then credit tokens. Two threads cannot both
+    /// credit the same nanos; a spurious weak-CAS failure retries rather than
+    /// leaving the timestamp stale.
+    fn apply_refill(&self, capacity_scaled: u64, rate_scaled: u64, now_nanos: u64) {
+        loop {
+            let last = self.last_refill_nanos.load(Ordering::Relaxed);
+            let added = refill_tokens(now_nanos.saturating_sub(last), rate_scaled);
+            if added == 0 {
+                return;
+            }
+            let claimed = nanos_for_tokens(added, rate_scaled);
+            if self
+                .last_refill_nanos
+                .compare_exchange_weak(
+                    last,
+                    last.saturating_add(claimed),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            let _ = self
+                .tokens
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                    if current >= capacity_scaled {
+                        None
+                    } else {
+                        Some(current.saturating_add(added).min(capacity_scaled))
+                    }
+                });
+            return;
         }
     }
 }
@@ -454,150 +412,51 @@ impl TokenBucket {
             }
         }
     }
-}
 
-// Implement the sealed trait marker
-impl super::private::Sealed for TokenBucket {}
+    fn check_impl(&self, key: &str, cost: u64) -> RateLimitDecision {
+        if cost == 0 {
+            return zero_cost_decision(self.capacity);
+        }
 
-#[async_trait]
-impl Algorithm for TokenBucket {
-    async fn check(&self, key: &str) -> Result<RateLimitDecision> {
         let now = self.now_nanos();
-
-        // Cleanup idle keys if TTL is configured (simple probabilistic cleanup)
-        // Only run cleanup 1% of the time to avoid overhead
-        if self.idle_ttl.is_some() && (now % 100) == 0 {
+        if self.idle_ttl.is_some() && should_cleanup() {
             self.cleanup_idle(now);
         }
 
-        // Get the appropriate shard for this key
         let shard = self.get_shard(key);
-
-        // Get or create token state for this key
-        // Zero-copy optimization: Use borrowed key for lookup, only allocate on insert
         let guard = shard.guard();
         let state = match shard.get(key, &guard) {
-            Some(state) => state.clone(),
+            Some(state) => state,
             None => {
-                // Insert new state - only allocates here when creating new key
                 let new_state = Arc::new(AtomicTokenState::new(self.capacity, now));
-                let key_string = key.to_string(); // Allocate only when inserting
-                match shard.try_insert(key_string, new_state.clone(), &guard) {
-                    Ok(_) => new_state,
-                    Err(current) => current.current.clone(), // Another thread inserted, use their value
+                match shard.try_insert(key.to_string(), new_state, &guard) {
+                    Ok(inserted) => inserted,
+                    Err(not_inserted) => not_inserted.current,
                 }
             }
         };
 
-        // Try to consume a token (cost of 1)
-        let (permitted, remaining) =
-            state.try_consume(self.capacity, self.refill_rate_per_second, now, 1);
-
-        // Calculate retry_after if rate limited
-        let retry_after = if !permitted {
-            // Calculate how long until we'll have a token available
-            // We need 1 token, and we refill at refill_rate_per_second tokens/sec
-            let tokens_needed = 1u64.saturating_sub(remaining);
-            let seconds_to_wait = if self.refill_rate_per_second > 0 {
-                tokens_needed as f64 / self.refill_rate_per_second as f64
-            } else {
-                1.0
-            };
-            Some(Duration::from_secs_f64(seconds_to_wait.max(0.001))) // Minimum 1ms
-        } else {
-            None
-        };
-
-        // Calculate reset time (time until bucket is full)
-        // If we have N tokens and capacity is M, time to refill is:
-        // (M - N) / refill_rate_per_second
-        let reset = if self.refill_rate_per_second > 0 && remaining < self.capacity {
-            let tokens_to_refill = self.capacity.saturating_sub(remaining);
-            let seconds_to_full = tokens_to_refill as f64 / self.refill_rate_per_second as f64;
-            Some(Duration::from_secs_f64(seconds_to_full.max(0.001))) // Minimum 1ms
-        } else if remaining >= self.capacity {
-            // Bucket is already full
-            Some(Duration::from_secs(0))
-        } else {
-            // Refill rate is 0, bucket will never refill
-            None
-        };
-
-        Ok(RateLimitDecision {
-            permitted,
-            retry_after,
-            remaining: Some(remaining),
-            limit: self.capacity,
-            reset,
-        })
-    }
-
-    async fn check_with_cost(&self, key: &str, cost: u64) -> Result<RateLimitDecision> {
-        let now = self.now_nanos();
-
-        // Cleanup idle keys if TTL is configured (simple probabilistic cleanup)
-        // Only run cleanup 1% of the time to avoid overhead
-        if self.idle_ttl.is_some() && (now % 100) == 0 {
-            self.cleanup_idle(now);
-        }
-
-        // Get the appropriate shard for this key
-        let shard = self.get_shard(key);
-
-        // Get or create token state for this key
-        // Zero-copy optimization: Use borrowed key for lookup, only allocate on insert
-        let guard = shard.guard();
-        let state = match shard.get(key, &guard) {
-            Some(state) => state.clone(),
-            None => {
-                // Insert new state - only allocates here when creating new key
-                let new_state = Arc::new(AtomicTokenState::new(self.capacity, now));
-                let key_string = key.to_string(); // Allocate only when inserting
-                match shard.try_insert(key_string, new_state.clone(), &guard) {
-                    Ok(_) => new_state,
-                    Err(current) => current.current.clone(), // Another thread inserted, use their value
-                }
-            }
-        };
-
-        // Try to consume tokens with the specified cost
         let (permitted, remaining) =
             state.try_consume(self.capacity, self.refill_rate_per_second, now, cost);
-
-        // Calculate retry_after if rate limited
-        let retry_after = if !permitted {
-            // Calculate how long until we'll have enough tokens available
-            let tokens_needed = cost.saturating_sub(remaining);
-            let seconds_to_wait = if self.refill_rate_per_second > 0 {
-                tokens_needed as f64 / self.refill_rate_per_second as f64
-            } else {
-                1.0
-            };
-            Some(Duration::from_secs_f64(seconds_to_wait.max(0.001))) // Minimum 1ms
-        } else {
-            None
-        };
-
-        // Calculate reset time (time until bucket is full)
-        let reset = if self.refill_rate_per_second > 0 && remaining < self.capacity {
-            let tokens_to_refill = self.capacity.saturating_sub(remaining);
-            let seconds_to_full = tokens_to_refill as f64 / self.refill_rate_per_second as f64;
-            Some(Duration::from_secs_f64(seconds_to_full.max(0.001))) // Minimum 1ms
-        } else if remaining >= self.capacity {
-            // Bucket is already full
-            Some(Duration::from_secs(0))
-        } else {
-            // Refill rate is 0, bucket will never refill
-            None
-        };
-
-        Ok(RateLimitDecision {
+        token_decision(
             permitted,
-            retry_after,
-            remaining: Some(remaining),
-            limit: self.capacity,
-            reset,
-        })
+            remaining,
+            self.capacity,
+            self.refill_rate_per_second,
+            cost,
+        )
+    }
+}
+
+impl super::private::Sealed for TokenBucket {}
+
+impl Algorithm for TokenBucket {
+    fn check(&self, key: &str) -> RateLimitDecision {
+        self.check_impl(key, 1)
+    }
+
+    fn check_with_cost(&self, key: &str, cost: u64) -> RateLimitDecision {
+        self.check_impl(key, cost)
     }
 }
 
@@ -611,12 +470,12 @@ mod tests {
 
         // First 10 requests should succeed (burst capacity)
         for _ in 0..10 {
-            let decision = bucket.check("test-key").await.unwrap();
+            let decision = bucket.check("test-key");
             assert!(decision.permitted, "Request should be permitted");
         }
 
         // 11th request should fail (bucket exhausted)
-        let decision = bucket.check("test-key").await.unwrap();
+        let decision = bucket.check("test-key");
         assert!(!decision.permitted, "Request should be rate limited");
     }
 
@@ -626,18 +485,18 @@ mod tests {
 
         // Exhaust the bucket
         for _ in 0..5 {
-            bucket.check("test-key").await.unwrap();
+            let _ = bucket.check("test-key");
         }
 
         // Should be rate limited
-        let decision = bucket.check("test-key").await.unwrap();
+        let decision = bucket.check("test-key");
         assert!(!decision.permitted);
 
         // Wait for refill (100ms = 1 token at 10/sec)
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Should work again
-        let decision = bucket.check("test-key").await.unwrap();
+        let decision = bucket.check("test-key");
         assert!(
             decision.permitted,
             "Request should be permitted after refill"
@@ -649,13 +508,13 @@ mod tests {
         let bucket = TokenBucket::new(2, 10);
 
         // Key 1: exhaust bucket
-        bucket.check("key1").await.unwrap();
-        bucket.check("key1").await.unwrap();
-        let decision = bucket.check("key1").await.unwrap();
+        let _ = bucket.check("key1");
+        let _ = bucket.check("key1");
+        let decision = bucket.check("key1");
         assert!(!decision.permitted, "key1 should be rate limited");
 
         // Key 2: should still work (separate bucket)
-        let decision = bucket.check("key2").await.unwrap();
+        let decision = bucket.check("key2");
         assert!(decision.permitted, "key2 should be permitted");
     }
 
@@ -665,12 +524,12 @@ mod tests {
 
         // Exhaust the bucket
         for i in 0..10 {
-            let decision = bucket.check("test-key").await.unwrap();
+            let decision = bucket.check("test-key");
             assert!(decision.permitted, "Request {} should be permitted", i + 1);
         }
 
         // Should be rate limited now
-        let decision = bucket.check("test-key").await.unwrap();
+        let decision = bucket.check("test-key");
         assert!(!decision.permitted, "Request should be rate limited");
         assert_eq!(
             decision.remaining,
@@ -683,7 +542,7 @@ mod tests {
 
         // Should have ~10 tokens now, so next 10 requests should work
         for i in 0..10 {
-            let decision = bucket.check("test-key").await.unwrap();
+            let decision = bucket.check("test-key");
             assert!(
                 decision.permitted,
                 "Request {} should be permitted after refill",
@@ -692,7 +551,7 @@ mod tests {
         }
 
         // Should be rate limited again
-        let decision = bucket.check("test-key").await.unwrap();
+        let decision = bucket.check("test-key");
         assert!(!decision.permitted, "Request should be rate limited again");
     }
 
@@ -702,7 +561,7 @@ mod tests {
 
         // Consume 50 tokens
         for _ in 0..50 {
-            bucket.check("test-key").await.unwrap();
+            let _ = bucket.check("test-key");
         }
 
         // Now we have 50 tokens remaining
@@ -712,12 +571,12 @@ mod tests {
         // Should now have 70 tokens (50 remaining + 20 refilled)
         // Consume 20 tokens
         for i in 0..20 {
-            let decision = bucket.check("test-key").await.unwrap();
+            let decision = bucket.check("test-key");
             assert!(decision.permitted, "Request {} should be permitted", i + 1);
         }
 
         // After consuming 20 more, we should have exactly 50 left (70 - 20 = 50)
-        let decision = bucket.check("test-key").await.unwrap();
+        let decision = bucket.check("test-key");
         assert!(decision.permitted, "Should still have tokens");
         // Account for the token we just consumed in the check above
         assert!(
@@ -736,13 +595,47 @@ mod tests {
 
         // Should only be able to consume 50 tokens (capacity limit)
         for i in 0..50 {
-            let decision = bucket.check("test-key").await.unwrap();
+            let decision = bucket.check("test-key");
             assert!(decision.permitted, "Request {} should be permitted", i + 1);
         }
 
         // 51st should fail
-        let decision = bucket.check("test-key").await.unwrap();
+        let decision = bucket.check("test-key");
         assert!(!decision.permitted, "Should be rate limited at capacity");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_contended_refill_does_not_over_admit() {
+        use std::sync::Arc;
+        let bucket = Arc::new(TokenBucket::new(100, 1_000));
+        // Drain the bucket on this thread first.
+        for _ in 0..100 {
+            assert!(bucket.check("hot").permitted);
+        }
+        tokio::time::advance(Duration::from_millis(50)).await;
+        // 50ms at 1000/s is 50 tokens. Eight tasks racing the same interval
+        // must not admit more than ~50 plus a small CAS-race remainder.
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let bucket = bucket.clone();
+            handles.push(tokio::spawn(async move {
+                let mut n = 0u64;
+                for _ in 0..20 {
+                    if bucket.check("hot").permitted {
+                        n += 1;
+                    }
+                }
+                n
+            }));
+        }
+        let mut total = 0u64;
+        for h in handles {
+            total += h.await.unwrap();
+        }
+        assert!(
+            total <= 60,
+            "contended refill over-admitted: {total} (expected ~50)"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -750,11 +643,11 @@ mod tests {
         let bucket = TokenBucket::new(1, 10); // 1 capacity, 10 tokens/sec
 
         // Consume the single token
-        let decision = bucket.check("test-key").await.unwrap();
+        let decision = bucket.check("test-key");
         assert!(decision.permitted);
 
         // Should be rate limited (0 tokens remaining)
-        let decision = bucket.check("test-key").await.unwrap();
+        let decision = bucket.check("test-key");
         assert!(!decision.permitted);
         assert!(decision.retry_after.is_some());
         assert_eq!(decision.remaining, Some(0));
@@ -779,7 +672,7 @@ mod tests {
         assert_eq!(bucket.refill_rate_per_second, super::MAX_RATE_PER_SEC);
 
         // Should still work correctly
-        let decision = bucket.check("test-key").await.unwrap();
+        let decision = bucket.check("test-key");
         assert!(decision.permitted, "Should work with clamped values");
     }
 
@@ -790,11 +683,11 @@ mod tests {
 
         // Exhaust some tokens
         for _ in 0..100 {
-            bucket.check("test-key").await.unwrap();
+            let _ = bucket.check("test-key");
         }
 
         // Should still work without overflow/panic
-        let _decision = bucket.check("test-key").await.unwrap();
+        let _decision = bucket.check("test-key");
         // Test passes if we get here without panic
     }
 
@@ -806,7 +699,7 @@ mod tests {
         let bucket = TokenBucket::with_ttl(10, 100, Duration::from_secs(1));
 
         // Access key1
-        bucket.check("key1").await.unwrap();
+        let _ = bucket.check("key1");
         assert_eq!(bucket.len(), 1);
 
         // Advance time by 2 seconds (past TTL)
@@ -815,7 +708,7 @@ mod tests {
         // Access key2, which should trigger cleanup of key1
         // Note: cleanup is probabilistic (1% chance), so we need to call multiple times
         for _ in 0..200 {
-            bucket.check("key2").await.unwrap();
+            let _ = bucket.check("key2");
         }
 
         // key1 should have been evicted (or will be soon)
@@ -838,7 +731,7 @@ mod tests {
 
         // Create multiple keys
         for i in 0..10 {
-            bucket.check(&format!("key{}", i)).await.unwrap();
+            let _ = bucket.check(&format!("key{}", i));
         }
 
         // All keys should be retained

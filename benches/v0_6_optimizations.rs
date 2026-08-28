@@ -1,21 +1,8 @@
-//! Benchmark v0.6.0 optimization techniques
+//! TokenBucket vs deprecated CachedTokenBucket.
 //!
 //! Run with: cargo bench --bench v0_6_optimizations
-//!
-//! This benchmark compares:
-//! 1. Baseline TokenBucket (flurry-based)
-//! 2. SIMD-optimized TokenBucket
-//! 3. Zero-copy TokenBucket
-//! 4. Thread-local cached TokenBucket
-//! 5. Combined optimizations
-//!
-//! Across different workload patterns:
-//! - Single-threaded
-//! - Multi-threaded (2, 4, 8, 16 threads)
-//! - Low key cardinality (10, 100 keys)
-//! - High key cardinality (10K, 100K keys)
-//! - Hot keys (80/20 distribution)
-//! - Cold keys (uniform distribution)
+
+#![allow(deprecated)]
 
 use criterion::{
     criterion_group, criterion_main, BenchmarkId, Criterion, PlotConfiguration, Throughput,
@@ -25,9 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use tokio::runtime::Runtime;
-use tokio_rate_limit::algorithm::{
-    CachedTokenBucket, SimdTokenBucket, TokenBucket, ZeroCopyTokenBucket,
-};
+#[allow(deprecated)]
+use tokio_rate_limit::algorithm::{CachedTokenBucket, TokenBucket};
 use tokio_rate_limit::Algorithm;
 
 /// Generate key with specific distribution
@@ -59,25 +45,25 @@ fn single_threaded_comparison(c: &mut Criterion) {
     group.bench_function("baseline_token_bucket", |b| {
         let bucket = TokenBucket::new(1_000_000, 1_000_000);
         b.to_async(&rt).iter(|| async {
-            let result = bucket.check(black_box("test-key")).await;
+            let result = bucket.check(black_box("test-key"));
             black_box(result)
         });
     });
 
     // SIMD-optimized
     group.bench_function("simd_token_bucket", |b| {
-        let bucket = SimdTokenBucket::new(1_000_000, 1_000_000);
+        let bucket = TokenBucket::new(1_000_000, 1_000_000);
         b.to_async(&rt).iter(|| async {
-            let result = bucket.check(black_box("test-key")).await;
+            let result = bucket.check(black_box("test-key"));
             black_box(result)
         });
     });
 
     // Zero-copy
     group.bench_function("zerocopy_token_bucket", |b| {
-        let bucket = ZeroCopyTokenBucket::new(1_000_000, 1_000_000);
+        let bucket = TokenBucket::new(1_000_000, 1_000_000);
         b.to_async(&rt).iter(|| async {
-            let result = bucket.check(black_box("test-key")).await;
+            let result = bucket.check(black_box("test-key"));
             black_box(result)
         });
     });
@@ -86,7 +72,7 @@ fn single_threaded_comparison(c: &mut Criterion) {
     group.bench_function("cached_token_bucket", |b| {
         let bucket = CachedTokenBucket::new(1_000_000, 1_000_000);
         b.to_async(&rt).iter(|| async {
-            let result = bucket.check(black_box("test-key")).await;
+            let result = bucket.check(black_box("test-key"));
             black_box(result)
         });
     });
@@ -126,7 +112,7 @@ fn multi_threaded_comparison(c: &mut Criterion) {
                             rt.block_on(async {
                                 for i in 0..iters {
                                     let key = format!("thread-key-{}", i % 100);
-                                    let _ = black_box(bucket.check(black_box(&key)).await);
+                                    let _ = black_box(bucket.check(black_box(&key)));
                                 }
                             });
                             start.elapsed()
@@ -150,7 +136,7 @@ fn multi_threaded_comparison(c: &mut Criterion) {
             &num_threads,
             |b, &threads| {
                 let rt = Runtime::new().unwrap();
-                let bucket = Arc::new(SimdTokenBucket::new(1_000_000, 1_000_000));
+                let bucket = Arc::new(TokenBucket::new(1_000_000, 1_000_000));
 
                 b.iter_custom(|iters| {
                     let barrier = Arc::new(std::sync::Barrier::new(threads));
@@ -168,7 +154,7 @@ fn multi_threaded_comparison(c: &mut Criterion) {
                             rt.block_on(async {
                                 for i in 0..iters {
                                     let key = format!("thread-key-{}", i % 100);
-                                    let _ = black_box(bucket.check(black_box(&key)).await);
+                                    let _ = black_box(bucket.check(black_box(&key)));
                                 }
                             });
                             start.elapsed()
@@ -192,7 +178,7 @@ fn multi_threaded_comparison(c: &mut Criterion) {
             &num_threads,
             |b, &threads| {
                 let rt = Runtime::new().unwrap();
-                let bucket = Arc::new(ZeroCopyTokenBucket::new(1_000_000, 1_000_000));
+                let bucket = Arc::new(TokenBucket::new(1_000_000, 1_000_000));
 
                 b.iter_custom(|iters| {
                     let barrier = Arc::new(std::sync::Barrier::new(threads));
@@ -210,7 +196,7 @@ fn multi_threaded_comparison(c: &mut Criterion) {
                             rt.block_on(async {
                                 for i in 0..iters {
                                     let key = format!("thread-key-{}", i % 100);
-                                    let _ = black_box(bucket.check(black_box(&key)).await);
+                                    let _ = black_box(bucket.check(black_box(&key)));
                                 }
                             });
                             start.elapsed()
@@ -252,7 +238,7 @@ fn multi_threaded_comparison(c: &mut Criterion) {
                             rt.block_on(async {
                                 for i in 0..iters {
                                     let key = format!("thread-key-{}", i % 100);
-                                    let _ = black_box(bucket.check(black_box(&key)).await);
+                                    let _ = black_box(bucket.check(black_box(&key)));
                                 }
                             });
                             start.elapsed()
@@ -297,7 +283,7 @@ fn key_cardinality_comparison(c: &mut Criterion) {
                     async move {
                         let idx = counter.fetch_add(1, Ordering::Relaxed);
                         let key = generate_key(idx, card, None);
-                        let result = bucket.check(black_box(&key)).await;
+                        let result = bucket.check(black_box(&key));
                         black_box(result)
                     }
                 });
@@ -309,7 +295,7 @@ fn key_cardinality_comparison(c: &mut Criterion) {
             BenchmarkId::new("zerocopy", format!("{}_keys", cardinality)),
             &cardinality,
             |b, &card| {
-                let bucket = Arc::new(ZeroCopyTokenBucket::new(1_000_000, 1_000_000));
+                let bucket = Arc::new(TokenBucket::new(1_000_000, 1_000_000));
                 let counter = Arc::clone(&counter);
 
                 b.to_async(&rt).iter(|| {
@@ -318,7 +304,7 @@ fn key_cardinality_comparison(c: &mut Criterion) {
                     async move {
                         let idx = counter.fetch_add(1, Ordering::Relaxed);
                         let key = generate_key(idx, card, None);
-                        let result = bucket.check(black_box(&key)).await;
+                        let result = bucket.check(black_box(&key));
                         black_box(result)
                     }
                 });
@@ -339,7 +325,7 @@ fn key_cardinality_comparison(c: &mut Criterion) {
                     async move {
                         let idx = counter.fetch_add(1, Ordering::Relaxed);
                         let key = generate_key(idx, card, None);
-                        let result = bucket.check(black_box(&key)).await;
+                        let result = bucket.check(black_box(&key));
                         black_box(result)
                     }
                 });
@@ -369,7 +355,7 @@ fn hot_key_distribution(c: &mut Criterion) {
             async move {
                 let idx = counter.fetch_add(1, Ordering::Relaxed);
                 let key = generate_key(idx, 1000, Some(0.8)); // 80% to 20% of keys
-                let result = bucket.check(black_box(&key)).await;
+                let result = bucket.check(black_box(&key));
                 black_box(result)
             }
         });
@@ -386,7 +372,7 @@ fn hot_key_distribution(c: &mut Criterion) {
             async move {
                 let idx = counter.fetch_add(1, Ordering::Relaxed);
                 let key = generate_key(idx, 1000, Some(0.8));
-                let result = bucket.check(black_box(&key)).await;
+                let result = bucket.check(black_box(&key));
                 black_box(result)
             }
         });
@@ -394,7 +380,7 @@ fn hot_key_distribution(c: &mut Criterion) {
 
     // Zero-copy with hot keys
     group.bench_function("zerocopy_hot_keys", |b| {
-        let bucket = Arc::new(ZeroCopyTokenBucket::new(1_000_000, 1_000_000));
+        let bucket = Arc::new(TokenBucket::new(1_000_000, 1_000_000));
         let counter = Arc::clone(&counter);
 
         b.to_async(&rt).iter(|| {
@@ -403,7 +389,7 @@ fn hot_key_distribution(c: &mut Criterion) {
             async move {
                 let idx = counter.fetch_add(1, Ordering::Relaxed);
                 let key = generate_key(idx, 1000, Some(0.8));
-                let result = bucket.check(black_box(&key)).await;
+                let result = bucket.check(black_box(&key));
                 black_box(result)
             }
         });
@@ -431,7 +417,7 @@ fn cold_key_distribution(c: &mut Criterion) {
             async move {
                 let idx = counter.fetch_add(1, Ordering::Relaxed);
                 let key = generate_key(idx, 10000, None); // Uniform distribution
-                let result = bucket.check(black_box(&key)).await;
+                let result = bucket.check(black_box(&key));
                 black_box(result)
             }
         });
@@ -448,7 +434,7 @@ fn cold_key_distribution(c: &mut Criterion) {
             async move {
                 let idx = counter.fetch_add(1, Ordering::Relaxed);
                 let key = generate_key(idx, 10000, None);
-                let result = bucket.check(black_box(&key)).await;
+                let result = bucket.check(black_box(&key));
                 black_box(result)
             }
         });
@@ -456,7 +442,7 @@ fn cold_key_distribution(c: &mut Criterion) {
 
     // Zero-copy with cold keys
     group.bench_function("zerocopy_cold_keys", |b| {
-        let bucket = Arc::new(ZeroCopyTokenBucket::new(1_000_000, 1_000_000));
+        let bucket = Arc::new(TokenBucket::new(1_000_000, 1_000_000));
         let counter = Arc::clone(&counter);
 
         b.to_async(&rt).iter(|| {
@@ -465,7 +451,7 @@ fn cold_key_distribution(c: &mut Criterion) {
             async move {
                 let idx = counter.fetch_add(1, Ordering::Relaxed);
                 let key = generate_key(idx, 10000, None);
-                let result = bucket.check(black_box(&key)).await;
+                let result = bucket.check(black_box(&key));
                 black_box(result)
             }
         });
@@ -488,18 +474,18 @@ fn memory_allocation_comparison(c: &mut Criterion) {
             // This will allocate key.to_string() every time
             for i in 0..100 {
                 let key = format!("key-{}", i % 10);
-                let _ = bucket.check(black_box(&key)).await;
+                let _ = bucket.check(black_box(&key));
             }
         });
     });
 
     // Zero-copy: only allocates on first access per key
     group.bench_function("zerocopy_allocations", |b| {
-        let bucket = ZeroCopyTokenBucket::new(1_000_000, 1_000_000);
+        let bucket = TokenBucket::new(1_000_000, 1_000_000);
         b.to_async(&rt).iter(|| async {
             for i in 0..100 {
                 let key = format!("key-{}", i % 10);
-                let _ = bucket.check(black_box(&key)).await;
+                let _ = bucket.check(black_box(&key));
             }
         });
     });

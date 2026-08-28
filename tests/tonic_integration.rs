@@ -519,7 +519,7 @@ async fn test_rate_limit_error_headers() {
 }
 
 #[tokio::test]
-async fn test_no_rate_limit_when_key_not_extracted() {
+async fn test_missing_key_fails_closed() {
     let limiter = Arc::new(
         RateLimiter::builder()
             .requests_per_second(1)
@@ -528,12 +528,33 @@ async fn test_no_rate_limit_when_key_not_extracted() {
             .unwrap(),
     );
 
-    // Extractor that returns None
     let extractor = CustomGrpcKeyExtractor::new(|_req| None);
     let layer = GrpcRateLimitLayer::with_extractor(limiter, extractor);
     let mut service = layer.layer(TestService);
 
-    // Multiple requests should all succeed when no key is extracted
+    let request = http::Request::builder()
+        .uri("http://localhost/test.Service/Method")
+        .body(Body::default())
+        .unwrap();
+
+    let response = service.ready().await.unwrap().call(request).await.unwrap();
+    assert_eq!(response.status(), 429);
+}
+
+#[tokio::test]
+async fn test_missing_key_fail_open() {
+    let limiter = Arc::new(
+        RateLimiter::builder()
+            .requests_per_second(1)
+            .burst(1)
+            .build()
+            .unwrap(),
+    );
+
+    let extractor = CustomGrpcKeyExtractor::new(|_req| None);
+    let layer = GrpcRateLimitLayer::with_extractor(limiter, extractor).fail_open();
+    let mut service = layer.layer(TestService);
+
     for _ in 0..10 {
         let request = http::Request::builder()
             .uri("http://localhost/test.Service/Method")

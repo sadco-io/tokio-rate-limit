@@ -31,7 +31,7 @@ fn raw_performance_single_threaded(c: &mut Criterion) {
         let limiter = RateLimiter::from_algorithm(algorithm);
 
         b.to_async(&rt).iter(|| async {
-            let result = limiter.check(black_box("test-key")).await;
+            let result = limiter.check(black_box("test-key"));
             black_box(result)
         });
     });
@@ -42,7 +42,7 @@ fn raw_performance_single_threaded(c: &mut Criterion) {
         let limiter = RateLimiter::from_algorithm(algorithm);
 
         b.to_async(&rt).iter(|| async {
-            let result = limiter.check(black_box("test-key")).await;
+            let result = limiter.check(black_box("test-key"));
             black_box(result)
         });
     });
@@ -84,7 +84,7 @@ fn raw_performance_multi_threaded(c: &mut Criterion) {
                             _rt.block_on(async {
                                 for i in 0..iters {
                                     let key = format!("thread-key-{}", i % 100);
-                                    let _ = black_box(limiter.check(black_box(&key)).await);
+                                    let _ = black_box(limiter.check(black_box(&key)));
                                 }
                             });
                             start.elapsed()
@@ -127,7 +127,7 @@ fn raw_performance_multi_threaded(c: &mut Criterion) {
                             _rt.block_on(async {
                                 for i in 0..iters {
                                     let key = format!("thread-key-{}", i % 100);
-                                    let _ = black_box(limiter.check(black_box(&key)).await);
+                                    let _ = black_box(limiter.check(black_box(&key)));
                                 }
                             });
                             start.elapsed()
@@ -177,7 +177,7 @@ fn burst_workload_simulation(c: &mut Criterion) {
                 // Send 100 requests as fast as possible (burst)
                 let mut permitted_count = 0;
                 for _ in 0..100 {
-                    let decision = limiter.check(black_box(&key)).await.unwrap();
+                    let decision = limiter.check(black_box(&key));
                     if decision.permitted {
                         permitted_count += 1;
                     }
@@ -204,7 +204,7 @@ fn burst_workload_simulation(c: &mut Criterion) {
                 // Send 100 requests as fast as possible
                 let mut permitted_count = 0;
                 for _ in 0..100 {
-                    let decision = limiter.check(black_box(&key)).await.unwrap();
+                    let decision = limiter.check(black_box(&key));
                     if decision.permitted {
                         permitted_count += 1;
                     }
@@ -247,7 +247,7 @@ fn steady_workload_simulation(c: &mut Criterion) {
                     if i > 0 {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                    let decision = limiter.check(black_box(&key)).await.unwrap();
+                    let decision = limiter.check(black_box(&key));
                     if decision.permitted {
                         permitted_count += 1;
                     }
@@ -277,7 +277,7 @@ fn steady_workload_simulation(c: &mut Criterion) {
                     if i > 0 {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                    let decision = limiter.check(black_box(&key)).await.unwrap();
+                    let decision = limiter.check(black_box(&key));
                     if decision.permitted {
                         permitted_count += 1;
                     }
@@ -319,7 +319,7 @@ fn backend_protection_scenario(c: &mut Criterion) {
                 // Simulate traffic spike: 50 requests immediately
                 let mut immediate_permitted = 0;
                 for _ in 0..50 {
-                    let decision = limiter.check(black_box(&key)).await.unwrap();
+                    let decision = limiter.check(black_box(&key));
                     if decision.permitted {
                         immediate_permitted += 1;
                     }
@@ -347,7 +347,7 @@ fn backend_protection_scenario(c: &mut Criterion) {
                 // Simulate traffic spike: 50 requests immediately
                 let mut immediate_permitted = 0;
                 for _ in 0..50 {
-                    let decision = limiter.check(black_box(&key)).await.unwrap();
+                    let decision = limiter.check(black_box(&key));
                     if decision.permitted {
                         immediate_permitted += 1;
                     }
@@ -376,9 +376,7 @@ fn cost_based_comparison(c: &mut Criterion) {
             let limiter = RateLimiter::from_algorithm(algorithm);
 
             b.to_async(&rt).iter(|| async {
-                let result = limiter
-                    .check_with_cost(black_box("test-key"), black_box(cost))
-                    .await;
+                let result = limiter.check_with_cost(black_box("test-key"), black_box(cost));
                 black_box(result)
             });
         });
@@ -389,9 +387,7 @@ fn cost_based_comparison(c: &mut Criterion) {
             let limiter = RateLimiter::from_algorithm(algorithm);
 
             b.to_async(&rt).iter(|| async {
-                let result = limiter
-                    .check_with_cost(black_box("test-key"), black_box(cost))
-                    .await;
+                let result = limiter.check_with_cost(black_box("test-key"), black_box(cost));
                 black_box(result)
             });
         });
@@ -426,7 +422,7 @@ fn high_key_cardinality(c: &mut Criterion) {
                         % num_keys as u128) as usize;
                     let key = format!("user-{}", key_idx);
 
-                    let result = limiter.check(black_box(&key)).await;
+                    let result = limiter.check(black_box(&key));
                     black_box(result)
                 });
             },
@@ -448,7 +444,7 @@ fn high_key_cardinality(c: &mut Criterion) {
                         % num_keys as u128) as usize;
                     let key = format!("user-{}", key_idx);
 
-                    let result = limiter.check(black_box(&key)).await;
+                    let result = limiter.check(black_box(&key));
                     black_box(result)
                 });
             },
@@ -486,7 +482,7 @@ fn rate_limiting_effectiveness(c: &mut Criterion) {
                 let mut denied = 0;
 
                 for _ in 0..50 {
-                    let decision = limiter.check(black_box(&key)).await.unwrap();
+                    let decision = limiter.check(black_box(&key));
                     if decision.permitted {
                         permitted += 1;
                     } else {
@@ -517,7 +513,7 @@ fn rate_limiting_effectiveness(c: &mut Criterion) {
                 let mut denied = 0;
 
                 for _ in 0..50 {
-                    let decision = limiter.check(black_box(&key)).await.unwrap();
+                    let decision = limiter.check(black_box(&key));
                     if decision.permitted {
                         permitted += 1;
                     } else {

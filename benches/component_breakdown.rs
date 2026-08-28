@@ -77,11 +77,11 @@ fn full_check<A: Algorithm>(name: &str, algorithm: &A, iters: u64) -> f64 {
         .unwrap();
     let elapsed = runtime.block_on(async {
         for _ in 0..iters / 10 {
-            black_box(algorithm.check(black_box("hot-key")).await.unwrap());
+            black_box(algorithm.check(black_box("hot-key")));
         }
         let start = Instant::now();
         for _ in 0..iters {
-            black_box(algorithm.check(black_box("hot-key")).await.unwrap());
+            black_box(algorithm.check(black_box("hot-key")));
         }
         start.elapsed()
     });
@@ -106,7 +106,7 @@ where
             let algorithm = Arc::clone(&algorithm);
             handles.push(tokio::spawn(async move {
                 for _ in 0..iters {
-                    black_box(algorithm.check(black_box("hot-key")).await.unwrap());
+                    black_box(algorithm.check(black_box("hot-key")));
                 }
             }));
         }

@@ -1,4 +1,6 @@
 //! Thread-local cached token bucket implementation.
+
+#![allow(deprecated)]
 //!
 //! This is a revisited implementation of thread-local caching, which showed a -6.4%
 //! regression in v0.1.0. This new approach uses different caching strategies to avoid
@@ -38,17 +40,16 @@
 //! - Worst case: -5% overhead (better than v0.1.0's -6.4%)
 //! - Target: 0% overhead for uniform distribution
 
+use crate::algorithm::internal::{
+    nanos_for_tokens, refill_tokens, should_cleanup, token_decision, zero_cost_decision, SCALE,
+};
 use crate::algorithm::Algorithm;
-use crate::error::Result;
 use crate::limiter::RateLimitDecision;
-use async_trait::async_trait;
 use flurry::HashMap as FlurryHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
-
-const SCALE: u64 = 1000;
 const MAX_BURST: u64 = u64::MAX / (2 * SCALE);
 const MAX_RATE_PER_SEC: u64 = u64::MAX / (2 * SCALE);
 
@@ -82,74 +83,57 @@ impl AtomicTokenState {
 
         let scaled_capacity = capacity.saturating_mul(SCALE);
         let token_cost = cost.saturating_mul(SCALE);
+        let rate_scaled = refill_rate_per_second.saturating_mul(SCALE);
+
+        self.apply_refill(scaled_capacity, rate_scaled, now_nanos);
 
         loop {
-            let current_tokens = self.tokens.load(Ordering::Relaxed);
-            let last_refill = self.last_refill_nanos.load(Ordering::Relaxed);
-
-            let elapsed_nanos = now_nanos.saturating_sub(last_refill);
-            let elapsed_secs = elapsed_nanos as f64 / 1_000_000_000.0;
-            let tokens_per_sec_scaled = refill_rate_per_second.saturating_mul(SCALE);
-            let new_tokens_to_add = (elapsed_secs * tokens_per_sec_scaled as f64) as u64;
-
-            let updated_tokens = current_tokens
-                .saturating_add(new_tokens_to_add)
-                .min(scaled_capacity);
-
-            if updated_tokens >= token_cost {
-                let new_tokens = updated_tokens.saturating_sub(token_cost);
-                let new_time = if new_tokens_to_add > 0 {
-                    now_nanos
-                } else {
-                    last_refill
-                };
-
-                match self.tokens.compare_exchange_weak(
-                    current_tokens,
-                    new_tokens,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        if new_tokens_to_add > 0 {
-                            let _ = self.last_refill_nanos.compare_exchange_weak(
-                                last_refill,
-                                new_time,
-                                Ordering::AcqRel,
-                                Ordering::Relaxed,
-                            );
-                        }
-                        return (true, new_tokens / SCALE);
-                    }
-                    Err(_) => continue,
-                }
-            } else {
-                let new_time = if new_tokens_to_add > 0 {
-                    now_nanos
-                } else {
-                    last_refill
-                };
-
-                match self.tokens.compare_exchange_weak(
-                    current_tokens,
-                    updated_tokens,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        if new_tokens_to_add > 0 {
-                            let _ = self.last_refill_nanos.compare_exchange_weak(
-                                last_refill,
-                                new_time,
-                                Ordering::AcqRel,
-                                Ordering::Relaxed,
-                            );
-                        }
-                        return (false, updated_tokens / SCALE);
-                    }
-                    Err(_) => continue,
-                }
+            let current = self.tokens.load(Ordering::Relaxed);
+            if current < token_cost {
+                return (false, current / SCALE);
             }
+            match self.tokens.compare_exchange_weak(
+                current,
+                current - token_cost,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(prev) => return (true, (prev - token_cost) / SCALE),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn apply_refill(&self, capacity_scaled: u64, rate_scaled: u64, now_nanos: u64) {
+        loop {
+            let last = self.last_refill_nanos.load(Ordering::Relaxed);
+            let added = refill_tokens(now_nanos.saturating_sub(last), rate_scaled);
+            if added == 0 {
+                return;
+            }
+            let claimed = nanos_for_tokens(added, rate_scaled);
+            if self
+                .last_refill_nanos
+                .compare_exchange_weak(
+                    last,
+                    last.saturating_add(claimed),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            let _ = self
+                .tokens
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                    if current >= capacity_scaled {
+                        None
+                    } else {
+                        Some(current.saturating_add(added).min(capacity_scaled))
+                    }
+                });
+            return;
         }
     }
 
@@ -225,7 +209,15 @@ thread_local! {
     static CACHE: RefCell<CacheEntry> = RefCell::new(CacheEntry::new());
 }
 
-/// Thread-local cached token bucket implementation
+/// Thread-local cached token bucket.
+///
+/// Deprecated: the thread-local cache keeps a ghost `Arc` after TTL eviction,
+/// so two buckets for the same key can run in parallel. Use [`TokenBucket`].
+/// Removal planned for 0.11.
+#[deprecated(
+    since = "0.10.0",
+    note = "thread-local cache splits from the map under TTL eviction; use TokenBucket. Removal planned for 0.11."
+)]
 pub struct CachedTokenBucket {
     capacity: u64,
     refill_rate_per_second: u64,
@@ -234,6 +226,7 @@ pub struct CachedTokenBucket {
     tokens: Arc<FlurryHashMap<String, Arc<AtomicTokenState>>>,
 }
 
+#[allow(deprecated)]
 impl CachedTokenBucket {
     /// Creates a new cached token bucket
     pub fn new(capacity: u64, refill_rate_per_second: u64) -> Self {
@@ -269,9 +262,12 @@ impl CachedTokenBucket {
         guard: &flurry::Guard<'_>,
         now_nanos: u64,
     ) -> Arc<AtomicTokenState> {
-        // Try thread-local cache first
-        if let Some(state) = CACHE.with(|cache| cache.borrow_mut().get(key)) {
-            return state;
+        // Never cache when TTL eviction is on: cleanup_idle drops map entries
+        // while this thread would keep debiting the ghost Arc.
+        if self.idle_ttl.is_none() {
+            if let Some(state) = CACHE.with(|cache| cache.borrow_mut().get(key)) {
+                return state;
+            }
         }
 
         // Cache miss: look up in main hashmap
@@ -291,8 +287,7 @@ impl CachedTokenBucket {
             }
         };
 
-        // Cache hot keys only (adaptive caching)
-        if state.is_hot_key() {
+        if self.idle_ttl.is_none() && state.is_hot_key() {
             CACHE.with(|cache| cache.borrow_mut().set(key.to_string(), state.clone()));
         }
 
@@ -326,94 +321,40 @@ impl CachedTokenBucket {
 
 impl super::private::Sealed for CachedTokenBucket {}
 
-#[async_trait]
-impl Algorithm for CachedTokenBucket {
-    async fn check(&self, key: &str) -> Result<RateLimitDecision> {
-        let now = self.now_nanos();
+#[allow(deprecated)]
+impl CachedTokenBucket {
+    fn check_impl(&self, key: &str, cost: u64) -> RateLimitDecision {
+        if cost == 0 {
+            return zero_cost_decision(self.capacity);
+        }
 
-        if self.idle_ttl.is_some() && (now % 100) == 0 {
+        let now = self.now_nanos();
+        if self.idle_ttl.is_some() && should_cleanup() {
             self.cleanup_idle(now);
         }
 
         let guard = self.tokens.guard();
         let state = self.get_or_create_state_cached(key, &guard, now);
-
-        let (permitted, remaining) =
-            state.try_consume(self.capacity, self.refill_rate_per_second, now, 1);
-
-        let retry_after = if !permitted {
-            let tokens_needed = 1u64.saturating_sub(remaining);
-            let seconds_to_wait = if self.refill_rate_per_second > 0 {
-                (tokens_needed as f64 / self.refill_rate_per_second as f64).ceil()
-            } else {
-                1.0
-            };
-            Some(Duration::from_secs_f64(seconds_to_wait.max(0.001)))
-        } else {
-            None
-        };
-
-        let reset = if self.refill_rate_per_second > 0 && remaining < self.capacity {
-            let tokens_to_refill = self.capacity.saturating_sub(remaining);
-            let seconds_to_full = tokens_to_refill as f64 / self.refill_rate_per_second as f64;
-            Some(Duration::from_secs_f64(seconds_to_full.max(0.001)))
-        } else if remaining >= self.capacity {
-            Some(Duration::from_secs(0))
-        } else {
-            None
-        };
-
-        Ok(RateLimitDecision {
-            permitted,
-            retry_after,
-            remaining: Some(remaining),
-            limit: self.capacity,
-            reset,
-        })
-    }
-
-    async fn check_with_cost(&self, key: &str, cost: u64) -> Result<RateLimitDecision> {
-        let now = self.now_nanos();
-
-        if self.idle_ttl.is_some() && (now % 100) == 0 {
-            self.cleanup_idle(now);
-        }
-
-        let guard = self.tokens.guard();
-        let state = self.get_or_create_state_cached(key, &guard, now);
-
         let (permitted, remaining) =
             state.try_consume(self.capacity, self.refill_rate_per_second, now, cost);
-
-        let retry_after = if !permitted {
-            let tokens_needed = cost.saturating_sub(remaining);
-            let seconds_to_wait = if self.refill_rate_per_second > 0 {
-                (tokens_needed as f64 / self.refill_rate_per_second as f64).ceil()
-            } else {
-                1.0
-            };
-            Some(Duration::from_secs_f64(seconds_to_wait.max(0.001)))
-        } else {
-            None
-        };
-
-        let reset = if self.refill_rate_per_second > 0 && remaining < self.capacity {
-            let tokens_to_refill = self.capacity.saturating_sub(remaining);
-            let seconds_to_full = tokens_to_refill as f64 / self.refill_rate_per_second as f64;
-            Some(Duration::from_secs_f64(seconds_to_full.max(0.001)))
-        } else if remaining >= self.capacity {
-            Some(Duration::from_secs(0))
-        } else {
-            None
-        };
-
-        Ok(RateLimitDecision {
+        token_decision(
             permitted,
-            retry_after,
-            remaining: Some(remaining),
-            limit: self.capacity,
-            reset,
-        })
+            remaining,
+            self.capacity,
+            self.refill_rate_per_second,
+            cost,
+        )
+    }
+}
+
+#[allow(deprecated)]
+impl Algorithm for CachedTokenBucket {
+    fn check(&self, key: &str) -> RateLimitDecision {
+        self.check_impl(key, 1)
+    }
+
+    fn check_with_cost(&self, key: &str, cost: u64) -> RateLimitDecision {
+        self.check_impl(key, cost)
     }
 }
 
@@ -426,11 +367,11 @@ mod tests {
         let bucket = CachedTokenBucket::new(10, 100);
 
         for _ in 0..10 {
-            let decision = bucket.check("test-key").await.unwrap();
+            let decision = bucket.check("test-key");
             assert!(decision.permitted);
         }
 
-        let decision = bucket.check("test-key").await.unwrap();
+        let decision = bucket.check("test-key");
         assert!(!decision.permitted);
     }
 
@@ -439,16 +380,16 @@ mod tests {
         let bucket = CachedTokenBucket::new(10, 100);
 
         for _ in 0..10 {
-            bucket.check("test-key").await.unwrap();
+            let _ = bucket.check("test-key");
         }
 
-        let decision = bucket.check("test-key").await.unwrap();
+        let decision = bucket.check("test-key");
         assert!(!decision.permitted);
 
         tokio::time::advance(Duration::from_millis(100)).await;
 
         for _ in 0..10 {
-            let decision = bucket.check("test-key").await.unwrap();
+            let decision = bucket.check("test-key");
             assert!(decision.permitted);
         }
     }
@@ -459,13 +400,13 @@ mod tests {
 
         // Access the same key repeatedly to make it "hot"
         for _ in 0..20 {
-            bucket.check("hot-key").await.unwrap();
+            let _ = bucket.check("hot-key");
         }
 
         // After 20 accesses, it should be cached
         // Subsequent accesses should hit the cache
         for _ in 0..100 {
-            bucket.check("hot-key").await.unwrap();
+            let _ = bucket.check("hot-key");
         }
     }
 }

@@ -596,6 +596,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "grpc-hello"
+version = "0.10.0"
+dependencies = [
+ "prost",
+ "tokio",
+ "tokio-rate-limit",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1827,9 +1841,8 @@ dependencies = [
 
 [[package]]
 name = "tokio-rate-limit"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
- "async-trait",
  "axum",
  "bytes",
  "criterion",
@@ -1841,8 +1854,6 @@ dependencies = [
  "hyper",
  "metrics",
  "papaya",
- "parking_lot",
- "prost",
  "redis",
  "scc",
  "serde",
@@ -1851,8 +1862,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
- "tonic-prost",
- "tonic-prost-build",
  "tower",
  "tracing",
  "tracing-subscriber",

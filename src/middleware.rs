@@ -22,6 +22,8 @@
 //! # }
 //! ```
 
+use crate::algorithm::internal::http_seconds_ceil;
+use crate::algorithm::{Algorithm, TokenBucket};
 use crate::{RateLimitDecision, RateLimiter};
 use axum::{
     body::Body,
@@ -47,11 +49,19 @@ pub trait KeyExtractor: Send + Sync + 'static {
     ///
     /// # Returns
     ///
-    /// A string key to use for rate limiting, or None if the request should not be rate limited.
+    /// A string key to use for rate limiting, or `None` if no key is available.
+    ///
+    /// When the extractor returns `None`, the layer denies the request (429)
+    /// unless [`RateLimitLayer::fail_open`] was set.
     fn extract(&self, req: &Request<Body>) -> Option<String>;
 }
 
 /// Default key extractor that uses the client's IP address.
+///
+/// Requires the server to be started with
+/// `into_make_service_with_connect_info::<SocketAddr>()`. Without that,
+/// `extract` returns `None` and the layer fails closed (429) unless
+/// [`RateLimitLayer::fail_open`] was set.
 #[derive(Clone, Default)]
 pub struct IpKeyExtractor;
 
@@ -128,65 +138,117 @@ where
 ///     .layer(RateLimitLayer::new(limiter));
 /// # }
 /// ```
-#[derive(Clone)]
-pub struct RateLimitLayer<E = IpKeyExtractor>
+pub struct RateLimitLayer<A = TokenBucket, E = IpKeyExtractor>
 where
+    A: Algorithm,
     E: KeyExtractor,
 {
-    limiter: Arc<RateLimiter>,
+    limiter: Arc<RateLimiter<A>>,
     extractor: E,
+    fail_open: bool,
 }
 
-impl RateLimitLayer<IpKeyExtractor> {
-    /// Creates a new rate limit layer with the default IP-based key extraction.
-    pub fn new(limiter: Arc<RateLimiter>) -> Self {
+impl<A, E> Clone for RateLimitLayer<A, E>
+where
+    A: Algorithm,
+    E: KeyExtractor + Clone,
+{
+    fn clone(&self) -> Self {
         Self {
-            limiter,
-            extractor: IpKeyExtractor,
+            limiter: self.limiter.clone(),
+            extractor: self.extractor.clone(),
+            fail_open: self.fail_open,
         }
     }
 }
 
-impl<E> RateLimitLayer<E>
-where
-    E: KeyExtractor,
-{
-    /// Creates a new rate limit layer with a custom key extractor.
-    pub fn with_extractor(limiter: Arc<RateLimiter>, extractor: E) -> Self {
-        Self { limiter, extractor }
+impl<A: Algorithm> RateLimitLayer<A, IpKeyExtractor> {
+    /// Creates a new rate limit layer with the default IP-based key extraction.
+    ///
+    /// Missing keys and the default [`IpKeyExtractor`] deny the request (429).
+    /// Call [`fail_open`](Self::fail_open) to restore the 0.9.x pass-through.
+    pub fn new(limiter: Arc<RateLimiter<A>>) -> Self {
+        Self {
+            limiter,
+            extractor: IpKeyExtractor,
+            fail_open: false,
+        }
     }
 }
 
-impl<S, E> Layer<S> for RateLimitLayer<E>
+impl<A, E> RateLimitLayer<A, E>
 where
+    A: Algorithm,
+    E: KeyExtractor,
+{
+    /// Creates a new rate limit layer with a custom key extractor.
+    pub fn with_extractor(limiter: Arc<RateLimiter<A>>, extractor: E) -> Self {
+        Self {
+            limiter,
+            extractor,
+            fail_open: false,
+        }
+    }
+
+    /// Pass through requests when the extractor returns `None`.
+    ///
+    /// The default is fail-closed (429).
+    pub fn fail_open(mut self) -> Self {
+        self.fail_open = true;
+        self
+    }
+}
+
+impl<S, A, E> Layer<S> for RateLimitLayer<A, E>
+where
+    A: Algorithm + 'static,
     E: KeyExtractor + Clone,
 {
-    type Service = RateLimitService<S, E>;
+    type Service = RateLimitService<S, A, E>;
 
     fn layer(&self, inner: S) -> Self::Service {
         RateLimitService {
             inner,
             limiter: self.limiter.clone(),
             extractor: self.extractor.clone(),
+            fail_open: self.fail_open,
         }
     }
 }
 
 /// The rate limiting middleware service.
-#[derive(Clone)]
-pub struct RateLimitService<S, E = IpKeyExtractor>
+pub struct RateLimitService<S, A = TokenBucket, E = IpKeyExtractor>
 where
+    A: Algorithm,
     E: KeyExtractor,
 {
     inner: S,
-    limiter: Arc<RateLimiter>,
+    limiter: Arc<RateLimiter<A>>,
     extractor: E,
+    fail_open: bool,
 }
 
-impl<S, E> Service<Request<Body>> for RateLimitService<S, E>
+impl<S, A, E> Clone for RateLimitService<S, A, E>
+where
+    S: Clone,
+    A: Algorithm,
+    E: KeyExtractor + Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            limiter: self.limiter.clone(),
+            extractor: self.extractor.clone(),
+            fail_open: self.fail_open,
+        }
+    }
+}
+
+impl<S, A, E> Service<Request<Body>> for RateLimitService<S, A, E>
 where
     S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
     S::Future: Send + 'static,
+    A: Algorithm + 'static,
     E: KeyExtractor + Clone,
 {
     type Response = Response<Body>;
@@ -202,26 +264,21 @@ where
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let limiter = self.limiter.clone();
         let extractor = self.extractor.clone();
+        let fail_open = self.fail_open;
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            // Extract the rate limit key
             let key = match extractor.extract(&req) {
                 Some(k) => k,
                 None => {
-                    // No key available, allow the request
-                    return inner.call(req).await;
+                    if fail_open {
+                        return inner.call(req).await;
+                    }
+                    return Ok(missing_key_response());
                 }
             };
 
-            // Check rate limit
-            let decision = match limiter.check(&key).await {
-                Ok(d) => d,
-                Err(_) => {
-                    // Error checking rate limit, allow the request to be safe
-                    return inner.call(req).await;
-                }
-            };
+            let decision = limiter.check(&key);
 
             if decision.permitted {
                 // Request is allowed, add rate limit headers and pass through
@@ -284,7 +341,7 @@ fn add_rate_limit_headers(response: &mut Response<Body>, decision: &RateLimitDec
     }
 
     if let Some(reset) = decision.reset {
-        let reset_seconds = reset.as_secs();
+        let reset_seconds = http_seconds_ceil(reset);
         headers.insert(
             "RateLimit-Reset",
             reset_seconds.to_string().parse().unwrap(),
@@ -337,7 +394,7 @@ fn rate_limit_response(decision: &RateLimitDecision) -> Response<Body> {
     }
 
     if let Some(reset) = decision.reset {
-        let reset_seconds = reset.as_secs();
+        let reset_seconds = http_seconds_ceil(reset);
         headers.insert(
             "RateLimit-Reset",
             reset_seconds.to_string().parse().unwrap(),
@@ -359,10 +416,18 @@ fn rate_limit_response(decision: &RateLimitDecision) -> Response<Body> {
 
     // Add Retry-After header (legacy, but still widely used)
     if let Some(retry_after) = decision.retry_after {
-        let seconds = retry_after.as_secs();
+        let seconds = http_seconds_ceil(retry_after);
         headers.insert("Retry-After", seconds.to_string().parse().unwrap());
     }
 
+    response
+}
+
+fn missing_key_response() -> Response<Body> {
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
+    response
+        .headers_mut()
+        .insert("Retry-After", "1".parse().unwrap());
     response
 }
 
@@ -508,5 +573,94 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_header_is_at_least_one_second() {
+        let limiter = Arc::new(
+            RateLimiter::builder()
+                .requests_per_second(10)
+                .burst(10)
+                .build()
+                .unwrap(),
+        );
+
+        let app = Router::new().route("/", get(|| async { "Hello" })).layer(
+            RateLimitLayer::with_extractor(
+                limiter,
+                CustomKeyExtractor::new(|_| Some("test-key".to_string())),
+            ),
+        );
+
+        for _ in 0..10 {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = response
+            .headers()
+            .get("Retry-After")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            retry_after, "1",
+            "sub-second wait must round up to 1s, not 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_key_fails_closed() {
+        let limiter = Arc::new(
+            RateLimiter::builder()
+                .requests_per_second(100)
+                .burst(100)
+                .build()
+                .unwrap(),
+        );
+
+        let app = Router::new()
+            .route("/", get(|| async { "Hello" }))
+            .layer(RateLimitLayer::new(limiter));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn missing_key_fail_open_opt_in() {
+        let limiter = Arc::new(
+            RateLimiter::builder()
+                .requests_per_second(100)
+                .burst(100)
+                .build()
+                .unwrap(),
+        );
+
+        let app = Router::new()
+            .route("/", get(|| async { "Hello" }))
+            .layer(RateLimitLayer::new(limiter).fail_open());
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

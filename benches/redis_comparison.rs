@@ -73,11 +73,12 @@ fn bench_in_memory_single(c: &mut Criterion) {
             requests_per_second: 1_000_000,
             burst: 1_000_000,
         })
+        .unwrap()
     });
 
     c.bench_function("in_memory/single_threaded", |b| {
         b.to_async(&rt).iter(|| async {
-            let permitted = limiter.check(black_box("test-key")).await.unwrap();
+            let permitted = limiter.check(black_box("test-key"));
             black_box(permitted)
         });
     });
@@ -129,6 +130,7 @@ fn bench_in_memory_concurrent(c: &mut Criterion) {
                         requests_per_second: 1_000_000,
                         burst: 1_000_000,
                     })
+                    .unwrap()
                 }));
 
                 b.iter_custom(|iters| {
@@ -147,7 +149,7 @@ fn bench_in_memory_concurrent(c: &mut Criterion) {
                             rt.block_on(async {
                                 for i in 0..iters {
                                     let key = format!("key-{}", (i + t as u64 * iters) % 100);
-                                    let _ = black_box(limiter.check(black_box(&key)).await);
+                                    let _ = black_box(limiter.check(black_box(&key)));
                                 }
                             });
                             start.elapsed()

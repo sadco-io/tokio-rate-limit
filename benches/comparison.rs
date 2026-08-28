@@ -26,10 +26,11 @@ fn comparison_single_threaded(c: &mut Criterion) {
                 requests_per_second: 1_000_000,
                 burst: 1_000_000,
             })
+            .unwrap()
         });
 
         b.to_async(&rt).iter(|| async {
-            let result = limiter.check(black_box("key")).await;
+            let result = limiter.check(black_box("key"));
             black_box(result)
         });
     });
@@ -66,6 +67,7 @@ fn comparison_concurrent(c: &mut Criterion) {
                         requests_per_second: 1_000_000,
                         burst: 1_000_000,
                     })
+                    .unwrap()
                 }));
 
                 b.iter_custom(|iters| {
@@ -84,7 +86,7 @@ fn comparison_concurrent(c: &mut Criterion) {
                             rt.block_on(async {
                                 for i in 0..iters {
                                     let key = format!("key-{}", i % 100);
-                                    let _ = black_box(limiter.check(black_box(&key)).await);
+                                    let _ = black_box(limiter.check(black_box(&key)));
                                 }
                             });
                             start.elapsed()

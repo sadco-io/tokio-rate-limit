@@ -4,11 +4,14 @@
 //!
 //! ## Features
 //!
-//! - **Lock-free token accounting**: Atomic operations on token counts (17M+ ops/sec)
-//! - **256-shard state management**: Lock-free concurrent hashmap (flurry) with micro-sharding
+//! - **Lock-free token accounting**: Atomic CAS on per-key buckets
+//! - **256-shard state management**: Lock-free concurrent hashmap (flurry)
 //! - **Pluggable algorithms**: Token bucket, leaky bucket, probabilistic sampling
-//! - **Axum middleware**: Drop-in rate limiting for web apps
-//! - **Zero allocations**: In the hot path
+//! - **Axum / Tonic middleware**: Drop-in HTTP and gRPC rate limiting
+//!
+//! Absolute throughput is hardware-specific; compare against `governor` with
+//! `benches/comparison.rs` on the machine you care about. The hot path still
+//! allocates on first sight of a key (the map insert).
 //!
 //! ## Architecture
 //!
@@ -28,9 +31,10 @@
 //!     let limiter = RateLimiter::new(RateLimiterConfig {
 //!         requests_per_second: 100,
 //!         burst: 200,
-//!     });
+//!     })
+//!     .unwrap();
 //!
-//!     let decision = limiter.check("client-id").await.unwrap();
+//!     let decision = limiter.check("client-id");
 //!     if decision.permitted {
 //!         // Process request
 //!     } else {
@@ -41,15 +45,18 @@
 
 #![warn(missing_docs, rust_2024_compatibility)]
 #![deny(unsafe_code)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod algorithm;
 mod error;
 mod limiter;
 
 #[cfg(feature = "middleware")]
+#[cfg_attr(docsrs, doc(cfg(feature = "middleware")))]
 pub mod middleware;
 
 #[cfg(feature = "tonic-support")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tonic-support")))]
 pub mod tonic_middleware;
 
 pub use error::{Error, Result};

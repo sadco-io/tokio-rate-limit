@@ -71,21 +71,17 @@
 //!   `sample_rate * cost` -- there the lump granularity dominates. A good rule
 //!   of thumb is `capacity >= 10 * sample_rate * cost`.
 
+use crate::algorithm::internal::{
+    fast_random, nanos_for_tokens as nanos_for_tokens_u64, refill_tokens as refill_tokens_u64,
+    token_decision, zero_cost_decision, SCALE,
+};
 use crate::algorithm::Algorithm;
-use crate::error::Result;
 use crate::limiter::RateLimitDecision;
-use async_trait::async_trait;
 use flurry::HashMap as FlurryHashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
-
-/// Scaling factor for sub-token precision.
-const SCALE: u64 = 1000;
-
-/// Nanoseconds in one second.
-const NANOS_PER_SEC: u128 = 1_000_000_000;
 
 /// Maximum burst capacity to prevent overflow.
 ///
@@ -101,49 +97,6 @@ const MAX_RATE_PER_SEC: u64 = (i64::MAX as u64) / (2 * SCALE);
 /// Number of shards for the HashMap.
 const NUM_SHARDS: usize = 256;
 
-// Fast random number generator state (thread-local).
-// Using xorshift64 for speed: https://en.wikipedia.org/wiki/Xorshift
-thread_local! {
-    static RNG_STATE: std::cell::Cell<u64> = std::cell::Cell::new(rng_seed());
-}
-
-/// Per-thread RNG seed.
-///
-/// Mixes the wall clock with a per-thread stack address and runs the result
-/// through a splitmix64 finalizer. Seeding from the clock alone gave threads
-/// spawned within the same timer tick identical xorshift streams, which
-/// correlates the random sampler phases of the keys those threads create.
-fn rng_seed() -> u64 {
-    let stack_probe = 0u8;
-    let mut seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9e37_79b9_7f4a_7c15)
-        ^ (std::ptr::addr_of!(stack_probe) as u64).rotate_left(32);
-    // splitmix64 finalizer: decorrelates nearby seeds.
-    seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    seed = (seed ^ (seed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    seed = (seed ^ (seed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    seed ^ (seed >> 31)
-}
-
-/// Fast thread-local random number generator.
-/// Uses xorshift64 algorithm for minimal overhead.
-#[inline]
-fn fast_random() -> u64 {
-    RNG_STATE.with(|state| {
-        let mut x = state.get();
-        if x == 0 {
-            x = 1;
-        }
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        state.set(x);
-        x
-    })
-}
-
 /// Scales a token count for sub-token precision, saturating at `i64::MAX`.
 #[inline]
 fn scaled(tokens: u64) -> i64 {
@@ -153,24 +106,16 @@ fn scaled(tokens: u64) -> i64 {
 /// Tokens (already scaled) accrued over `elapsed_nanos` at `rate_scaled` per second.
 #[inline]
 fn refill_tokens(elapsed_nanos: u64, rate_scaled: u64) -> i64 {
-    if elapsed_nanos == 0 || rate_scaled == 0 {
-        return 0;
-    }
-    let added = (u128::from(elapsed_nanos) * u128::from(rate_scaled)) / NANOS_PER_SEC;
-    added.min(i64::MAX as u128) as i64
+    refill_tokens_u64(elapsed_nanos, rate_scaled).min(i64::MAX as u64) as i64
 }
 
 /// Inverse of [`refill_tokens`]: the elapsed time that `added` tokens account for.
-///
-/// Used so that the fractional remainder of a refill is carried forward instead
-/// of being discarded, which would let the bucket drift slow.
 #[inline]
 fn nanos_for_tokens(added: i64, rate_scaled: u64) -> u64 {
-    if added <= 0 || rate_scaled == 0 {
+    if added <= 0 {
         return 0;
     }
-    let nanos = (added as u128 * NANOS_PER_SEC) / u128::from(rate_scaled);
-    nanos.min(u128::from(u64::MAX)) as u64
+    nanos_for_tokens_u64(added as u64, rate_scaled)
 }
 
 /// A uniformly random amount in `[0, accrued]`.
@@ -743,6 +688,10 @@ impl ProbabilisticTokenBucket {
     /// call, and skipping the `Arc` clone/drop removes two contended
     /// reference-count updates per request.
     fn check_impl(&self, key: &str, cost: u64) -> RateLimitDecision {
+        if cost == 0 {
+            return zero_cost_decision(self.capacity);
+        }
+
         let now = LazyNow::new(&self.reference_instant);
         let track_access = self.idle_ttl.is_some();
 
@@ -773,35 +722,13 @@ impl ProbabilisticTokenBucket {
             track_access,
         );
 
-        let retry_after = if !permitted {
-            let tokens_needed = cost.saturating_sub(remaining);
-            let seconds_to_wait = if self.refill_rate_per_second > 0 {
-                (tokens_needed as f64 / self.refill_rate_per_second as f64).ceil()
-            } else {
-                1.0
-            };
-            Some(Duration::from_secs_f64(seconds_to_wait.max(0.001)))
-        } else {
-            None
-        };
-
-        let reset = if self.refill_rate_per_second > 0 && remaining < self.capacity {
-            let tokens_to_refill = self.capacity.saturating_sub(remaining);
-            let seconds_to_full = tokens_to_refill as f64 / self.refill_rate_per_second as f64;
-            Some(Duration::from_secs_f64(seconds_to_full.max(0.001)))
-        } else if remaining >= self.capacity {
-            Some(Duration::from_secs(0))
-        } else {
-            None
-        };
-
-        RateLimitDecision {
+        token_decision(
             permitted,
-            retry_after,
-            remaining: Some(remaining),
-            limit: self.capacity,
-            reset,
-        }
+            remaining,
+            self.capacity,
+            self.refill_rate_per_second,
+            cost,
+        )
     }
 
     /// Get the configured sampling rate.
@@ -818,14 +745,13 @@ impl ProbabilisticTokenBucket {
 
 impl super::private::Sealed for ProbabilisticTokenBucket {}
 
-#[async_trait]
 impl Algorithm for ProbabilisticTokenBucket {
-    async fn check(&self, key: &str) -> Result<RateLimitDecision> {
-        Ok(self.check_impl(key, 1))
+    fn check(&self, key: &str) -> RateLimitDecision {
+        self.check_impl(key, 1)
     }
 
-    async fn check_with_cost(&self, key: &str, cost: u64) -> Result<RateLimitDecision> {
-        Ok(self.check_impl(key, cost))
+    fn check_with_cost(&self, key: &str, cost: u64) -> RateLimitDecision {
+        self.check_impl(key, cost)
     }
 }
 
@@ -840,12 +766,12 @@ mod tests {
 
         // First 10 requests should succeed
         for _ in 0..10 {
-            let decision = bucket.check("test-key").await.unwrap();
+            let decision = bucket.check("test-key");
             assert!(decision.permitted);
         }
 
         // 11th should fail
-        let decision = bucket.check("test-key").await.unwrap();
+        let decision = bucket.check("test-key");
         assert!(!decision.permitted);
     }
 
@@ -853,12 +779,12 @@ mod tests {
     async fn test_multiple_keys() {
         let bucket = ProbabilisticTokenBucket::new(2, 10, 1);
 
-        bucket.check("key1").await.unwrap();
-        bucket.check("key1").await.unwrap();
-        let decision = bucket.check("key1").await.unwrap();
+        let _ = bucket.check("key1");
+        let _ = bucket.check("key1");
+        let decision = bucket.check("key1");
         assert!(!decision.permitted);
 
-        let decision = bucket.check("key2").await.unwrap();
+        let decision = bucket.check("key2");
         assert!(decision.permitted);
     }
 
@@ -868,16 +794,16 @@ mod tests {
 
         // Exhaust bucket
         for _ in 0..5 {
-            bucket.check("test-key").await.unwrap();
+            let _ = bucket.check("test-key");
         }
 
-        let decision = bucket.check("test-key").await.unwrap();
+        let decision = bucket.check("test-key");
         assert!(!decision.permitted);
 
         // Wait for refill
         tokio::time::advance(Duration::from_millis(100)).await;
 
-        let decision = bucket.check("test-key").await.unwrap();
+        let decision = bucket.check("test-key");
         assert!(decision.permitted);
     }
 
@@ -889,7 +815,7 @@ mod tests {
         // Run many requests - should not panic or deadlock
         for i in 0..1000 {
             let key = format!("key-{}", i % 10);
-            let _ = bucket.check(&key).await.unwrap();
+            let _ = bucket.check(&key);
         }
     }
 
@@ -898,16 +824,16 @@ mod tests {
         let bucket = ProbabilisticTokenBucket::new(100, 100, 1);
 
         // Consume 50 tokens
-        let decision = bucket.check_with_cost("test-key", 50).await.unwrap();
+        let decision = bucket.check_with_cost("test-key", 50);
         assert!(decision.permitted);
         assert!(decision.remaining.unwrap() >= 40 && decision.remaining.unwrap() <= 50);
 
         // Consume another 50
-        let decision = bucket.check_with_cost("test-key", 50).await.unwrap();
+        let decision = bucket.check_with_cost("test-key", 50);
         assert!(decision.permitted);
 
         // Should be exhausted
-        let decision = bucket.check_with_cost("test-key", 50).await.unwrap();
+        let decision = bucket.check_with_cost("test-key", 50);
         assert!(!decision.permitted);
     }
 
@@ -915,14 +841,14 @@ mod tests {
     async fn test_ttl_eviction() {
         let bucket = ProbabilisticTokenBucket::with_ttl(10, 100, 1, Duration::from_secs(1));
 
-        bucket.check("key1").await.unwrap();
+        let _ = bucket.check("key1");
         assert_eq!(bucket.len(), 1);
 
         tokio::time::advance(Duration::from_secs(2)).await;
 
         // Trigger cleanup
         for _ in 0..200 {
-            bucket.check("key2").await.unwrap();
+            let _ = bucket.check("key2");
         }
 
         // key1 should eventually be evicted
