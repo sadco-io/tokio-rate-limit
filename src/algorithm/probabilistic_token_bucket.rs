@@ -166,6 +166,23 @@ impl AtomicProbabilisticState {
         tick % u64::from(sample_rate) == 0
     }
 
+    #[inline]
+    fn cas_tokens(&self, mut f: impl FnMut(i64) -> Option<i64>) -> Result<i64, i64> {
+        let mut current = self.tokens.load(Ordering::Relaxed);
+        while let Some(next) = f(current) {
+            match self.tokens.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(prev) => return Ok(prev),
+                Err(actual) => current = actual,
+            }
+        }
+        Err(current)
+    }
+
     fn apply_refill(&self, capacity_scaled: i64, rate_scaled: u64, now_nanos: u64) {
         loop {
             let last = self.last_refill_nanos.load(Ordering::Relaxed);
@@ -186,15 +203,13 @@ impl AtomicProbabilisticState {
             {
                 continue;
             }
-            let _ = self
-                .tokens
-                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
-                    if current >= capacity_scaled {
-                        None
-                    } else {
-                        Some(current.saturating_add(added).min(capacity_scaled))
-                    }
-                });
+            let _ = self.cas_tokens(|current| {
+                if current >= capacity_scaled {
+                    None
+                } else {
+                    Some(current.saturating_add(added).min(capacity_scaled))
+                }
+            });
             return;
         }
     }
@@ -230,15 +245,13 @@ impl AtomicProbabilisticState {
         cost_scaled: i64,
     ) -> (bool, u64) {
         self.apply_refill(capacity_scaled, rate_scaled, now_nanos);
-        match self
-            .tokens
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
-                if current >= cost_scaled {
-                    Some(current - cost_scaled)
-                } else {
-                    None
-                }
-            }) {
+        match self.cas_tokens(|current| {
+            if current >= cost_scaled {
+                Some(current - cost_scaled)
+            } else {
+                None
+            }
+        }) {
             Ok(previous) => (true, remaining_of(previous - cost_scaled)),
             Err(current) => (false, remaining_of(current)),
         }
@@ -297,10 +310,7 @@ impl AtomicProbabilisticState {
             ((i128::from(lump) * i128::from(observed)) / i128::from(ramp)) as i64
         };
         let previous = if debit > 0 {
-            self.tokens
-                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |tokens| {
-                    Some(tokens.saturating_sub(debit))
-                })
+            self.cas_tokens(|tokens| Some(tokens.saturating_sub(debit)))
                 .unwrap_or(observed)
         } else {
             self.tokens.load(Ordering::Relaxed)
