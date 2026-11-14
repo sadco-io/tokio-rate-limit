@@ -6,10 +6,10 @@
 //! - Extracting rate limit metadata from responses
 //!
 //! Before running this, start the server:
-//!   cargo run --example grpc_tonic --features tonic-support
+//!   cargo run -p grpc-hello --bin grpc-hello
 //!
 //! Then run this client:
-//!   cargo run --example grpc_tonic_client --features tonic-support
+//!   cargo run -p grpc-hello --bin grpc-hello-client
 
 use std::time::Duration;
 use tokio::time::sleep;

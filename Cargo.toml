@@ -4,18 +4,18 @@ default-members = ["."]
 
 [package]
 name = "tokio-rate-limit"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 # 1.85 is the floor for the default build and for `middleware`.
 # The `tonic-support` feature additionally requires 1.88 -- tonic,
 # tonic-prost and tonic-prost-build all declare rust-version = "1.88".
 rust-version = "1.85"
 authors = ["Daniel Curtis <drc@danielryancurtis.com>"]
-description = "High-performance, lock-free rate limiting library with pluggable algorithms and Axum middleware"
+description = "High-performance, lock-free rate limiting library with pluggable algorithms and Axum/Tonic middleware"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sadco-io/tokio-rate-limit"
 documentation = "https://docs.rs/tokio-rate-limit"
-keywords = ["rate-limit", "rate-limiting", "token-bucket", "axum", "middleware"]
+keywords = ["rate-limit", "rate-limiting", "token-bucket", "axum", "tonic"]
 categories = ["web-programming", "asynchronous", "network-programming"]
 readme = "README.md"
 include = [
@@ -28,38 +28,42 @@ include = [
 
 [features]
 default = []
-middleware = ["axum", "tower"]
-tonic-support = ["tonic", "tower", "http"]
+middleware = ["axum", "tower", "http", "pin-project-lite"]
+tonic-support = ["tonic", "tower", "http", "pin-project-lite"]
 observability = ["tracing"]
-metrics-support = ["metrics", "observability"]
+metrics-support = ["metrics"]
+serde = ["dep:serde"]
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.53", features = ["sync", "time"] }
+tokio = { version = "1.53.3", features = ["time"] }
 
-# Concurrency primitives
+# Concurrency primitives & hashing
 flurry = "0.5.2"
+ahash = { version = "0.8.12", default-features = false, features = ["std", "compile-time-rng"] }
 
-# Optional: Axum middleware
+# Optional: Axum / HTTP middleware
 axum = { version = "0.8.9", optional = true }
 tower = { version = "0.5.3", optional = true }
+http = { version = "1.5", optional = true }
+pin-project-lite = { version = "0.2.17", optional = true }
 
 # Optional: Tonic gRPC middleware
 tonic = { version = "0.14.6", optional = true }
-http = { version = "1.5", optional = true }
 
-# Optional: Observability
+# Optional: Observability & Serialization
 tracing = { version = "0.1.44", optional = true }
 metrics = { version = "0.24.6", optional = true }
+serde = { version = "1.0.228", features = ["derive"], optional = true }
 
 # Error handling
 thiserror = "2.0.20"
 
 [dev-dependencies]
-tokio = { version = "1.53", features = ["full", "test-util"] }
+tokio = { version = "1.53.3", features = ["full", "test-util"] }
 criterion = { version = "0.8", features = ["async_tokio", "html_reports"] }
 axum = "0.8.9"
-tower = "0.5"
+tower = { version = "0.5", features = ["limit", "util"] }
 hyper = "1.11"
 http-body-util = "0.1.5"
 bytes = "1.0"

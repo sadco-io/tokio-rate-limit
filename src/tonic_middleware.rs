@@ -1,28 +1,28 @@
 //! Tonic middleware integration for gRPC rate limiting.
 //!
-//! This module provides Tower middleware for integrating the rate limiter with Tonic gRPC services.
-//! Unlike HTTP interceptors, this implementation uses Tower's Layer and Service traits to provide
-//! comprehensive rate limiting with access to both requests and responses.
+//! Provides Tower `Layer` and `Service` implementations for Tonic gRPC servers with:
+//! - Spec-compliant gRPC over HTTP/2 wire status (`HTTP 200 OK` + `grpc-status: 8`
+//!   [`tonic::Code::ResourceExhausted`]) so gRPC clients and proxies receive the exact
+//!   `RESOURCE_EXHAUSTED` code and rate-limit metadata instead of `UNAVAILABLE`.
+//! - Zero-allocation borrowed method/metadata/IP key extraction and unboxed futures.
+//! - Per-RPC cost hooks (`.with_cost(...)`) and custom `Status` hooks (`.on_rejected(...)`).
+//! - Proper Tower `poll_ready` readiness swapping for stateful inner layers.
 //!
 //! # Example
 //!
 //! ```ignore
 //! use tonic::transport::Server;
 //! use tokio_rate_limit::{RateLimiter, tonic_middleware::GrpcRateLimitLayer};
-//! use std::sync::Arc;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let limiter = Arc::new(RateLimiter::builder()
+//! let limiter = RateLimiter::builder()
 //!     .requests_per_second(100)
 //!     .burst(200)
-//!     .build()?);
+//!     .build()?;
 //!
-//! let layer = GrpcRateLimitLayer::new(limiter);
-//!
-//! // Apply to your gRPC server
 //! Server::builder()
-//!     .layer(layer)
-//!     .add_service(your_service)  // Add your gRPC service
+//!     .layer(GrpcRateLimitLayer::new(limiter))
+//!     .add_service(your_service)
 //!     .serve("[::1]:50051".parse()?)
 //!     .await?;
 //! # Ok(())
@@ -30,126 +30,283 @@
 //! ```
 
 use crate::algorithm::internal::http_seconds_ceil;
-use crate::algorithm::{Algorithm, TokenBucket};
-use crate::{RateLimitDecision, RateLimiter};
-use std::sync::Arc;
+pub use crate::algorithm::internal::StackIp;
+use crate::algorithm::{Algorithm, RateLimitKey, ToKey, TokenBucket};
+use crate::{IntoRateLimiter, RateLimitDecision, RateLimiter};
+use http::{header::HeaderName, HeaderValue};
+use pin_project_lite::pin_project;
+use std::borrow::{Borrow, Cow};
+use std::fmt;
+use std::future::Future;
+use std::hash::Hash;
+use std::net::{IpAddr, SocketAddr};
+use std::ops::Deref;
+use std::pin::Pin;
 use std::task::{Context, Poll};
 use tonic::body::Body;
-use tonic::{Code, Status};
+use tonic::Status;
 use tower::{Layer, Service};
 
-/// A trait for extracting rate limit keys from gRPC requests.
-///
-/// Implement this trait to customize how rate limit keys are extracted
-/// from incoming gRPC requests. The default implementation uses the method path.
-pub trait GrpcKeyExtractor: Send + Sync + 'static {
-    /// Extracts a rate limit key from the gRPC request.
-    ///
-    /// # Arguments
-    ///
-    /// * `req` - The incoming HTTP/2 request (gRPC uses HTTP/2)
-    ///
-    /// # Returns
-    ///
-    /// A string key to use for rate limiting, or None if the request should not be rate limited.
-    fn extract(&self, req: &http::Request<Body>) -> Option<String>;
+const HDR_X_RATELIMIT_LIMIT: HeaderName = HeaderName::from_static("x-ratelimit-limit");
+const HDR_X_RATELIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-remaining");
+const HDR_X_RATELIMIT_RESET: HeaderName = HeaderName::from_static("x-ratelimit-reset");
+const HDR_RETRY_AFTER: HeaderName = HeaderName::from_static("retry-after");
+
+/// Borrowed, stack-formatted, or owned string key extracted from a gRPC request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrpcExtractedKey<'a> {
+    /// Borrowed string slice from the gRPC URI path or metadata headers (zero allocation).
+    Borrowed(&'a str),
+    /// Stack-formatted IPv4 or IPv6 peer address (zero heap allocation).
+    Ip(StackIp),
+    /// Owned string key (for dynamically formatted composite keys).
+    Owned(String),
 }
 
-/// Default key extractor that uses the gRPC method path.
-///
-/// This allows per-method rate limiting, where different RPC methods
-/// can have different rate limits.
-///
-/// # Example
-///
-/// For a request to `/helloworld.Greeter/SayHello`, the key will be:
-/// `helloworld.Greeter/SayHello`
-#[derive(Clone, Default)]
-pub struct MethodKeyExtractor;
-
-impl GrpcKeyExtractor for MethodKeyExtractor {
-    fn extract(&self, req: &http::Request<Body>) -> Option<String> {
-        // Extract the gRPC method path from the URI
-        // Format: /{package}.{service}/{method}
-        let path = req.uri().path();
-        if let Some(stripped) = path.strip_prefix('/') {
-            Some(stripped.to_string())
-        } else {
-            Some(path.to_string())
+impl<'a> GrpcExtractedKey<'a> {
+    /// Returns the extracted key as a `&str`.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Borrowed(s) => s,
+            Self::Ip(ip) => ip.as_str(),
+            Self::Owned(s) => s.as_str(),
         }
     }
 }
 
-/// Key extractor that uses client IP address for rate limiting.
+impl Deref for GrpcExtractedKey<'_> {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<&str> for GrpcExtractedKey<'_> {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<String> for GrpcExtractedKey<'_> {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl<'a> From<&'a str> for GrpcExtractedKey<'a> {
+    #[inline]
+    fn from(s: &'a str) -> Self {
+        Self::Borrowed(s)
+    }
+}
+
+impl From<String> for GrpcExtractedKey<'static> {
+    #[inline]
+    fn from(s: String) -> Self {
+        Self::Owned(s)
+    }
+}
+
+impl<'a> From<Cow<'a, str>> for GrpcExtractedKey<'a> {
+    #[inline]
+    fn from(c: Cow<'a, str>) -> Self {
+        match c {
+            Cow::Borrowed(s) => Self::Borrowed(s),
+            Cow::Owned(s) => Self::Owned(s),
+        }
+    }
+}
+
+impl From<IpAddr> for GrpcExtractedKey<'static> {
+    #[inline]
+    fn from(ip: IpAddr) -> Self {
+        Self::Ip(StackIp::from_ip(ip))
+    }
+}
+
+/// Bridges an extracted gRPC key representation to a borrowed lookup query on `K`.
+pub trait GrpcLookupKey<K: RateLimitKey> {
+    /// Borrowed query type (`str` for `String`-keyed limiters, `K` for typed limiters).
+    type Query: Hash + Ord + fmt::Debug + ToKey<K> + ?Sized;
+
+    /// Borrows `self` as `&Self::Query`.
+    fn as_query(&self) -> &Self::Query;
+}
+
+impl<K: RateLimitKey> GrpcLookupKey<K> for K {
+    type Query = K;
+
+    #[inline]
+    fn as_query(&self) -> &K {
+        self
+    }
+}
+
+impl GrpcLookupKey<String> for &str {
+    type Query = str;
+
+    #[inline]
+    fn as_query(&self) -> &str {
+        self
+    }
+}
+
+impl GrpcLookupKey<String> for StackIp {
+    type Query = str;
+
+    #[inline]
+    fn as_query(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl GrpcLookupKey<String> for GrpcExtractedKey<'_> {
+    type Query = str;
+
+    #[inline]
+    fn as_query(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// Trait for extracting rate limit keys from incoming gRPC requests.
+pub trait GrpcKeyExtractor<K: RateLimitKey = String>: Send + Sync + 'static {
+    /// Extracted key type, potentially borrowing from the request for `'a`.
+    type Key<'a>: GrpcLookupKey<K>;
+
+    /// Extracts a rate limit key from the gRPC HTTP/2 request, or `None` if unavailable.
+    fn extract<'a>(&'a self, req: &'a http::Request<Body>) -> Option<Self::Key<'a>>;
+}
+
+/// Default key extractor that borrows the gRPC method path (`{package}.{Service}/{Method}`)
+/// directly from the request URI with zero heap allocation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MethodKeyExtractor;
+
+impl GrpcKeyExtractor<String> for MethodKeyExtractor {
+    type Key<'a> = &'a str;
+
+    #[inline]
+    fn extract<'a>(&'a self, req: &'a http::Request<Body>) -> Option<&'a str> {
+        let path = req.uri().path();
+        Some(path.strip_prefix('/').unwrap_or(path))
+    }
+}
+
+/// Key extractor that uses the client IP address for gRPC rate limiting.
 ///
-/// Prefers a `SocketAddr` in request extensions (peer address). Spoofable
-/// forwarding headers are a fallback: `x-forwarded-for` uses the *last* hop,
-/// then `x-real-ip`. Missing keys fail closed unless
-/// [`GrpcRateLimitLayer::fail_open`] is set.
-#[derive(Clone, Default)]
+/// Prefers a `SocketAddr` in request extensions (peer address), falling back to
+/// the *last* hop of `x-forwarded-for` and then `x-real-ip` with zero heap allocation.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct IpKeyExtractor;
 
-impl GrpcKeyExtractor for IpKeyExtractor {
-    fn extract(&self, req: &http::Request<Body>) -> Option<String> {
-        if let Some(addr) = req.extensions().get::<std::net::SocketAddr>() {
-            return Some(addr.ip().to_string());
+impl IpKeyExtractor {
+    /// Extracts the client IP address from peer `SocketAddr` extensions, `x-forwarded-for`,
+    /// or `x-real-ip` with zero heap allocation.
+    #[inline]
+    pub fn extract<'a>(&'a self, req: &'a http::Request<Body>) -> Option<GrpcExtractedKey<'a>> {
+        if let Some(addr) = req.extensions().get::<SocketAddr>() {
+            return Some(GrpcExtractedKey::Ip(StackIp::from_ip(addr.ip())));
         }
 
         req.headers()
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next_back().map(|h| h.trim().to_string()))
+            .and_then(|s| s.split(',').next_back().map(str::trim))
             .filter(|s| !s.is_empty())
             .or_else(|| {
                 req.headers()
                     .get("x-real-ip")
                     .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
+            .map(GrpcExtractedKey::Borrowed)
+    }
+}
+
+impl GrpcKeyExtractor<String> for IpKeyExtractor {
+    type Key<'a> = GrpcExtractedKey<'a>;
+
+    #[inline]
+    fn extract<'a>(&'a self, req: &'a http::Request<Body>) -> Option<GrpcExtractedKey<'a>> {
+        Self::extract(self, req)
+    }
+}
+
+impl GrpcKeyExtractor<IpAddr> for IpKeyExtractor {
+    type Key<'a> = IpAddr;
+
+    #[inline]
+    fn extract<'a>(&'a self, req: &'a http::Request<Body>) -> Option<IpAddr> {
+        if let Some(addr) = req.extensions().get::<SocketAddr>() {
+            return Some(addr.ip());
+        }
+
+        req.headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next_back().map(str::trim))
+            .and_then(|s| s.parse::<IpAddr>().ok())
+            .or_else(|| {
+                req.headers()
+                    .get("x-real-ip")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<IpAddr>().ok())
             })
     }
 }
 
-/// Key extractor that uses metadata from the gRPC request.
-///
-/// This allows extracting custom identifiers from gRPC metadata headers,
-/// such as user IDs, API keys, or tenant IDs.
+/// Zero-allocation gRPC metadata header key extractor.
 ///
 /// # Example
 ///
 /// ```no_run
 /// use tokio_rate_limit::tonic_middleware::MetadataKeyExtractor;
 ///
-/// // Extract rate limit key from "user-id" metadata
 /// let extractor = MetadataKeyExtractor::new("user-id");
 /// ```
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct MetadataKeyExtractor {
-    header_name: String,
+    header_name: HeaderName,
 }
 
 impl MetadataKeyExtractor {
-    /// Creates a new metadata key extractor.
+    /// Creates a new metadata key extractor for `header_name`.
     ///
-    /// # Arguments
+    /// # Panics
     ///
-    /// * `header_name` - The metadata header name to extract (e.g., "user-id", "x-api-key")
-    pub fn new(header_name: impl Into<String>) -> Self {
+    /// Panics if `header_name` is not a valid HTTP/2 metadata header name.
+    pub fn new(header_name: impl AsRef<str>) -> Self {
+        let name = HeaderName::from_bytes(header_name.as_ref().as_bytes())
+            .expect("valid gRPC metadata header name");
+        Self { header_name: name }
+    }
+
+    /// Creates a metadata key extractor from a lowercase `'static` header name.
+    pub const fn from_static(header_name: &'static str) -> Self {
         Self {
-            header_name: header_name.into(),
+            header_name: HeaderName::from_static(header_name),
         }
     }
 }
 
-impl GrpcKeyExtractor for MetadataKeyExtractor {
-    fn extract(&self, req: &http::Request<Body>) -> Option<String> {
+impl GrpcKeyExtractor<String> for MetadataKeyExtractor {
+    type Key<'a> = &'a str;
+
+    #[inline]
+    fn extract<'a>(&'a self, req: &'a http::Request<Body>) -> Option<&'a str> {
         req.headers()
             .get(&self.header_name)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
     }
 }
 
-/// A custom key extractor that uses a closure.
+/// Custom gRPC key extractor backed by a closure.
 ///
 /// # Example
 ///
@@ -157,7 +314,6 @@ impl GrpcKeyExtractor for MetadataKeyExtractor {
 /// use tokio_rate_limit::tonic_middleware::CustomGrpcKeyExtractor;
 ///
 /// let extractor = CustomGrpcKeyExtractor::new(|req| {
-///     // Combine method path and user ID
 ///     let method = req.uri().path().trim_start_matches('/');
 ///     let user = req.headers()
 ///         .get("user-id")
@@ -166,348 +322,563 @@ impl GrpcKeyExtractor for MetadataKeyExtractor {
 /// });
 /// ```
 #[derive(Clone)]
-pub struct CustomGrpcKeyExtractor<F>
-where
-    F: Fn(&http::Request<Body>) -> Option<String> + Send + Sync + Clone + 'static,
-{
+pub struct CustomGrpcKeyExtractor<F> {
     extractor: F,
 }
 
-impl<F> CustomGrpcKeyExtractor<F>
-where
-    F: Fn(&http::Request<Body>) -> Option<String> + Send + Sync + Clone + 'static,
-{
-    /// Creates a new custom key extractor with the given function.
-    pub fn new(extractor: F) -> Self {
-        Self { extractor }
+impl<F> fmt::Debug for CustomGrpcKeyExtractor<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CustomGrpcKeyExtractor")
+            .finish_non_exhaustive()
     }
 }
 
-impl<F> GrpcKeyExtractor for CustomGrpcKeyExtractor<F>
+impl<F> CustomGrpcKeyExtractor<F> {
+    /// Creates a custom gRPC key extractor from a closure returning `Option<K>`
+    /// (for example `Option<String>`, `Option<IpAddr>`, or `Option<u64>`).
+    pub fn new<K>(extractor: F) -> Self
+    where
+        K: RateLimitKey,
+        F: Fn(&http::Request<Body>) -> Option<K> + Send + Sync + Clone + 'static,
+    {
+        Self { extractor }
+    }
+
+    /// Creates a zero-allocation custom gRPC key extractor borrowing `&str` directly from `&Request<Body>`.
+    pub fn borrowed(extractor: F) -> BorrowedGrpcKeyExtractor<F>
+    where
+        F: for<'a> Fn(&'a http::Request<Body>) -> Option<&'a str> + Send + Sync + Clone + 'static,
+    {
+        BorrowedGrpcKeyExtractor { extractor }
+    }
+}
+
+impl<K, F> GrpcKeyExtractor<K> for CustomGrpcKeyExtractor<F>
 where
-    F: Fn(&http::Request<Body>) -> Option<String> + Send + Sync + Clone + 'static,
+    K: RateLimitKey,
+    F: Fn(&http::Request<Body>) -> Option<K> + Send + Sync + Clone + 'static,
 {
-    fn extract(&self, req: &http::Request<Body>) -> Option<String> {
+    type Key<'a> = K;
+
+    #[inline]
+    fn extract<'a>(&'a self, req: &'a http::Request<Body>) -> Option<K> {
         (self.extractor)(req)
+    }
+}
+
+/// Zero-allocation custom gRPC key extractor borrowing `&str` from `&http::Request<Body>`.
+#[derive(Clone)]
+pub struct BorrowedGrpcKeyExtractor<F> {
+    extractor: F,
+}
+
+impl<F> fmt::Debug for BorrowedGrpcKeyExtractor<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BorrowedGrpcKeyExtractor")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F> GrpcKeyExtractor<String> for BorrowedGrpcKeyExtractor<F>
+where
+    F: for<'a> Fn(&'a http::Request<Body>) -> Option<&'a str> + Send + Sync + Clone + 'static,
+{
+    type Key<'a> = &'a str;
+
+    #[inline]
+    fn extract<'a>(&'a self, req: &'a http::Request<Body>) -> Option<&'a str> {
+        (self.extractor)(req)
+    }
+}
+
+/// Per-RPC token cost function used by [`GrpcRateLimitLayer`].
+pub trait GrpcCostExtractor: Send + Sync + 'static {
+    /// Computes the token cost for `req`.
+    fn cost(&self, req: &http::Request<Body>) -> u64;
+}
+
+/// Default unit cost (`1` token per RPC).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GrpcUnitCost;
+
+impl GrpcCostExtractor for GrpcUnitCost {
+    #[inline]
+    fn cost(&self, _req: &http::Request<Body>) -> u64 {
+        1
+    }
+}
+
+/// Closure-backed gRPC cost extractor created via [`GrpcRateLimitLayer::with_cost`].
+#[derive(Clone)]
+pub struct CustomGrpcCostExtractor<F> {
+    cost_fn: F,
+}
+
+impl<F> fmt::Debug for CustomGrpcCostExtractor<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CustomGrpcCostExtractor")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F> GrpcCostExtractor for CustomGrpcCostExtractor<F>
+where
+    F: Fn(&http::Request<Body>) -> u64 + Send + Sync + Clone + 'static,
+{
+    #[inline]
+    fn cost(&self, req: &http::Request<Body>) -> u64 {
+        (self.cost_fn)(req)
+    }
+}
+
+/// Customizes the gRPC [`Status`] returned when a request is rate limited.
+pub trait GrpcRejectionHandler: Send + Sync + 'static {
+    /// Produces an HTTP/2 gRPC error response for a denied [`RateLimitDecision`].
+    fn reject(&self, decision: &RateLimitDecision) -> http::Response<Body>;
+}
+
+/// Default `RESOURCE_EXHAUSTED` gRPC status handler.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultGrpcRejectionHandler;
+
+impl GrpcRejectionHandler for DefaultGrpcRejectionHandler {
+    #[inline]
+    fn reject(&self, decision: &RateLimitDecision) -> http::Response<Body> {
+        rate_limit_error_response(Status::resource_exhausted("Rate limit exceeded"), decision)
+    }
+}
+
+/// Closure-backed gRPC rejection handler created via [`GrpcRateLimitLayer::on_rejected`].
+#[derive(Clone)]
+pub struct CustomGrpcRejectionHandler<F> {
+    handler: F,
+}
+
+impl<F> fmt::Debug for CustomGrpcRejectionHandler<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CustomGrpcRejectionHandler")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F> GrpcRejectionHandler for CustomGrpcRejectionHandler<F>
+where
+    F: Fn(&RateLimitDecision) -> Status + Send + Sync + Clone + 'static,
+{
+    #[inline]
+    fn reject(&self, decision: &RateLimitDecision) -> http::Response<Body> {
+        let status = (self.handler)(decision);
+        rate_limit_error_response(status, decision)
     }
 }
 
 /// Tower layer for adding rate limiting to a Tonic gRPC service.
 ///
-/// This layer wraps gRPC services with rate limiting middleware. It uses Tower's
-/// Layer trait, making it composable with other middleware.
-///
-/// # Example
-///
-/// ```ignore
-/// use tonic::transport::Server;
-/// use tokio_rate_limit::{RateLimiter, tonic_middleware::GrpcRateLimitLayer};
-/// use std::sync::Arc;
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let limiter = Arc::new(RateLimiter::builder()
-///     .requests_per_second(100)
-///     .burst(200)
-///     .build()?);
-///
-/// Server::builder()
-///     .layer(GrpcRateLimitLayer::new(limiter))
-///     .add_service(your_service)  // Add your gRPC service
-///     .serve("[::1]:50051".parse()?)
-///     .await?;
-/// # Ok(())
-/// # }
-/// ```
-pub struct GrpcRateLimitLayer<A = TokenBucket, E = MethodKeyExtractor>
-where
+/// Accepts either a [`RateLimiter`] directly or an `Arc<RateLimiter>`.
+pub struct GrpcRateLimitLayer<
+    A = TokenBucket,
+    E = MethodKeyExtractor,
+    C = GrpcUnitCost,
+    R = DefaultGrpcRejectionHandler,
+> where
     A: Algorithm,
-    E: GrpcKeyExtractor,
 {
-    limiter: Arc<RateLimiter<A>>,
+    limiter: RateLimiter<A>,
     extractor: E,
+    cost_extractor: C,
+    rejection_handler: R,
     fail_open: bool,
 }
 
-impl<A, E> Clone for GrpcRateLimitLayer<A, E>
+impl<A, E, C, R> Clone for GrpcRateLimitLayer<A, E, C, R>
 where
     A: Algorithm,
-    E: GrpcKeyExtractor + Clone,
+    E: Clone,
+    C: Clone,
+    R: Clone,
 {
     fn clone(&self) -> Self {
         Self {
             limiter: self.limiter.clone(),
             extractor: self.extractor.clone(),
+            cost_extractor: self.cost_extractor.clone(),
+            rejection_handler: self.rejection_handler.clone(),
             fail_open: self.fail_open,
         }
     }
 }
 
-impl<A: Algorithm> GrpcRateLimitLayer<A, MethodKeyExtractor> {
-    /// Creates a new gRPC rate limit layer with the default method-based key extraction.
-    pub fn new(limiter: Arc<RateLimiter<A>>) -> Self {
+impl<A, E, C, R> fmt::Debug for GrpcRateLimitLayer<A, E, C, R>
+where
+    A: Algorithm,
+    E: fmt::Debug,
+    C: fmt::Debug,
+    R: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GrpcRateLimitLayer")
+            .field("limiter", &self.limiter)
+            .field("extractor", &self.extractor)
+            .field("cost_extractor", &self.cost_extractor)
+            .field("rejection_handler", &self.rejection_handler)
+            .field("fail_open", &self.fail_open)
+            .finish()
+    }
+}
+
+impl<A: Algorithm>
+    GrpcRateLimitLayer<A, MethodKeyExtractor, GrpcUnitCost, DefaultGrpcRejectionHandler>
+{
+    /// Creates a new gRPC rate limit layer with default method-path key extraction.
+    pub fn new(limiter: impl IntoRateLimiter<A>) -> Self {
         Self {
-            limiter,
+            limiter: limiter.into_rate_limiter(),
             extractor: MethodKeyExtractor,
+            cost_extractor: GrpcUnitCost,
+            rejection_handler: DefaultGrpcRejectionHandler,
             fail_open: false,
         }
     }
 }
 
-impl<A, E> GrpcRateLimitLayer<A, E>
-where
-    A: Algorithm,
-    E: GrpcKeyExtractor,
-{
-    /// Creates a new gRPC rate limit layer with a custom key extractor.
-    pub fn with_extractor(limiter: Arc<RateLimiter<A>>, extractor: E) -> Self {
+impl<A: Algorithm, E> GrpcRateLimitLayer<A, E, GrpcUnitCost, DefaultGrpcRejectionHandler> {
+    /// Creates a new gRPC rate limit layer with a custom [`GrpcKeyExtractor`].
+    pub fn with_extractor(limiter: impl IntoRateLimiter<A>, extractor: E) -> Self {
         Self {
-            limiter,
+            limiter: limiter.into_rate_limiter(),
             extractor,
+            cost_extractor: GrpcUnitCost,
+            rejection_handler: DefaultGrpcRejectionHandler,
             fail_open: false,
         }
     }
+}
 
-    /// Pass through requests when the extractor returns `None`. Default is fail-closed.
+impl<A, E, C, R> GrpcRateLimitLayer<A, E, C, R>
+where
+    A: Algorithm,
+{
+    /// Passes through requests when the key extractor returns `None` (default is fail-closed).
     pub fn fail_open(mut self) -> Self {
         self.fail_open = true;
         self
     }
+
+    /// Configures a per-RPC token cost function (for example charging higher cost on
+    /// expensive RPC methods).
+    pub fn with_cost<F>(self, cost_fn: F) -> GrpcRateLimitLayer<A, E, CustomGrpcCostExtractor<F>, R>
+    where
+        F: Fn(&http::Request<Body>) -> u64 + Send + Sync + Clone + 'static,
+    {
+        GrpcRateLimitLayer {
+            limiter: self.limiter,
+            extractor: self.extractor,
+            cost_extractor: CustomGrpcCostExtractor { cost_fn },
+            rejection_handler: self.rejection_handler,
+            fail_open: self.fail_open,
+        }
+    }
+
+    /// Customizes the [`tonic::Status`] returned when an RPC is rate limited.
+    ///
+    /// Rate limit metadata (`x-ratelimit-limit`, `x-ratelimit-remaining`, `retry-after`,
+    /// `x-ratelimit-reset`) is automatically attached if not already present on `Status`.
+    pub fn on_rejected<F>(
+        self,
+        handler: F,
+    ) -> GrpcRateLimitLayer<A, E, C, CustomGrpcRejectionHandler<F>>
+    where
+        F: Fn(&RateLimitDecision) -> Status + Send + Sync + Clone + 'static,
+    {
+        GrpcRateLimitLayer {
+            limiter: self.limiter,
+            extractor: self.extractor,
+            cost_extractor: self.cost_extractor,
+            rejection_handler: CustomGrpcRejectionHandler { handler },
+            fail_open: self.fail_open,
+        }
+    }
 }
 
-impl<S, A, E> Layer<S> for GrpcRateLimitLayer<A, E>
+impl<S, A, E, C, R> Layer<S> for GrpcRateLimitLayer<A, E, C, R>
 where
-    A: Algorithm + 'static,
-    E: GrpcKeyExtractor + Clone,
+    A: Algorithm,
+    E: Clone,
+    C: Clone,
+    R: Clone,
 {
-    type Service = GrpcRateLimitService<S, A, E>;
+    type Service = GrpcRateLimitService<S, A, E, C, R>;
 
     fn layer(&self, inner: S) -> Self::Service {
         GrpcRateLimitService {
             inner,
             limiter: self.limiter.clone(),
             extractor: self.extractor.clone(),
+            cost_extractor: self.cost_extractor.clone(),
+            rejection_handler: self.rejection_handler.clone(),
             fail_open: self.fail_open,
         }
     }
 }
 
-/// The gRPC rate limiting middleware service.
-pub struct GrpcRateLimitService<S, A = TokenBucket, E = MethodKeyExtractor>
-where
+/// The gRPC rate limiting Tower [`Service`].
+pub struct GrpcRateLimitService<
+    S,
+    A = TokenBucket,
+    E = MethodKeyExtractor,
+    C = GrpcUnitCost,
+    R = DefaultGrpcRejectionHandler,
+> where
     A: Algorithm,
-    E: GrpcKeyExtractor,
 {
     inner: S,
-    limiter: Arc<RateLimiter<A>>,
+    limiter: RateLimiter<A>,
     extractor: E,
+    cost_extractor: C,
+    rejection_handler: R,
     fail_open: bool,
 }
 
-impl<S, A, E> Clone for GrpcRateLimitService<S, A, E>
+impl<S, A, E, C, R> Clone for GrpcRateLimitService<S, A, E, C, R>
 where
     S: Clone,
     A: Algorithm,
-    E: GrpcKeyExtractor + Clone,
+    E: Clone,
+    C: Clone,
+    R: Clone,
 {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
             limiter: self.limiter.clone(),
             extractor: self.extractor.clone(),
+            cost_extractor: self.cost_extractor.clone(),
+            rejection_handler: self.rejection_handler.clone(),
             fail_open: self.fail_open,
         }
     }
 }
 
-impl<S, A, E> Service<http::Request<Body>> for GrpcRateLimitService<S, A, E>
+impl<S, A, E, C, R> fmt::Debug for GrpcRateLimitService<S, A, E, C, R>
 where
-    S: Service<http::Request<Body>, Response = http::Response<Body>> + Clone + Send + 'static,
-    S::Future: Send + 'static,
-    S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+    S: fmt::Debug,
+    A: Algorithm,
+    E: fmt::Debug,
+    C: fmt::Debug,
+    R: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GrpcRateLimitService")
+            .field("inner", &self.inner)
+            .field("limiter", &self.limiter)
+            .field("extractor", &self.extractor)
+            .field("cost_extractor", &self.cost_extractor)
+            .field("rejection_handler", &self.rejection_handler)
+            .field("fail_open", &self.fail_open)
+            .finish()
+    }
+}
+
+pin_project! {
+    /// Unboxed response future returned by [`GrpcRateLimitService`].
+    pub struct GrpcRateLimitFuture<F> {
+        #[pin]
+        state: GrpcFutureState<F>,
+    }
+}
+
+pin_project! {
+    #[project = GrpcFutureStateProj]
+    enum GrpcFutureState<F> {
+        PassThrough {
+            #[pin]
+            future: F,
+            decision: Option<RateLimitDecision>,
+        },
+        Immediate {
+            response: Option<http::Response<Body>>,
+        },
+    }
+}
+
+impl<F, Err> Future for GrpcRateLimitFuture<F>
+where
+    F: Future<Output = Result<http::Response<Body>, Err>>,
+    Err: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    type Output = Result<http::Response<Body>, Box<dyn std::error::Error + Send + Sync>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.project().state.project() {
+            GrpcFutureStateProj::PassThrough { future, decision } => match future.poll(cx) {
+                Poll::Ready(Ok(response)) => {
+                    let response = match decision.take() {
+                        Some(dec) => add_rate_limit_metadata(response, &dec),
+                        None => response,
+                    };
+                    Poll::Ready(Ok(response))
+                }
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
+                Poll::Pending => Poll::Pending,
+            },
+            GrpcFutureStateProj::Immediate { response } => Poll::Ready(Ok(response
+                .take()
+                .expect("GrpcRateLimitFuture polled after completion"))),
+        }
+    }
+}
+
+impl<S, A, E, C, R> Service<http::Request<Body>> for GrpcRateLimitService<S, A, E, C, R>
+where
+    S: Service<http::Request<Body>, Response = http::Response<Body>> + Clone,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     A: Algorithm + 'static,
-    E: GrpcKeyExtractor + Clone,
+    E: GrpcKeyExtractor<A::Key>,
+    for<'a> A::Key: Borrow<<E::Key<'a> as GrpcLookupKey<A::Key>>::Query>,
+    C: GrpcCostExtractor,
+    R: GrpcRejectionHandler,
 {
     type Response = http::Response<Body>;
     type Error = Box<dyn std::error::Error + Send + Sync>;
-    type Future = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
-    >;
+    type Future = GrpcRateLimitFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
     fn call(&mut self, req: http::Request<Body>) -> Self::Future {
-        let limiter = self.limiter.clone();
-        let extractor = self.extractor.clone();
-        let fail_open = self.fail_open;
-        let mut inner = self.inner.clone();
+        let maybe_decision =
+            <E as GrpcKeyExtractor<A::Key>>::extract(&self.extractor, &req).map(|extracted| {
+                let cost = self.cost_extractor.cost(&req);
+                self.limiter.check_with_cost(extracted.as_query(), cost)
+            });
 
-        Box::pin(async move {
-            let key = match extractor.extract(&req) {
-                Some(k) => k,
-                None => {
-                    if fail_open {
-                        return inner.call(req).await.map_err(Into::into);
-                    }
-                    return Ok(rate_limit_error_response(&RateLimitDecision {
-                        permitted: false,
-                        retry_after: Some(std::time::Duration::from_secs(1)),
-                        remaining: Some(0),
-                        limit: 0,
-                        reset: None,
-                    }));
-                }
-            };
-
-            let decision = limiter.check(&key);
-
-            if decision.permitted {
-                // Request is allowed, add rate limit metadata and pass through
-                #[cfg(feature = "metrics-support")]
-                {
-                    metrics::counter!("tokio_rate_limit.grpc.requests.allowed").increment(1);
-                    if let Some(remaining) = decision.remaining {
-                        metrics::histogram!("tokio_rate_limit.grpc.remaining_tokens")
-                            .record(remaining as f64);
-                    }
-                }
-
-                let response = inner.call(req).await.map_err(Into::into)?;
-                Ok(add_rate_limit_trailer(response, &decision))
-            } else {
-                // Request is rate limited
-                #[cfg(feature = "metrics-support")]
-                {
-                    metrics::counter!("tokio_rate_limit.grpc.requests.denied").increment(1);
-                    if let Some(remaining) = decision.remaining {
-                        metrics::histogram!("tokio_rate_limit.grpc.remaining_tokens")
-                            .record(remaining as f64);
-                    }
-                }
-
-                Ok(rate_limit_error_response(&decision))
+        let Some(decision) = maybe_decision else {
+            if self.fail_open {
+                let clone = self.inner.clone();
+                let mut inner = std::mem::replace(&mut self.inner, clone);
+                return GrpcRateLimitFuture {
+                    state: GrpcFutureState::PassThrough {
+                        future: inner.call(req),
+                        decision: None,
+                    },
+                };
             }
-        })
+
+            #[cfg(feature = "metrics-support")]
+            {
+                metrics::counter!("tokio_rate_limit.requests.denied").increment(1);
+                metrics::counter!("tokio_rate_limit.grpc.requests.denied").increment(1);
+            }
+
+            let missing_decision = RateLimitDecision {
+                permitted: false,
+                retry_after: Some(std::time::Duration::from_secs(1)),
+                remaining: Some(0),
+                limit: 0,
+                reset: None,
+            };
+            return GrpcRateLimitFuture {
+                state: GrpcFutureState::Immediate {
+                    response: Some(self.rejection_handler.reject(&missing_decision)),
+                },
+            };
+        };
+
+        if decision.permitted {
+            #[cfg(feature = "metrics-support")]
+            {
+                metrics::counter!("tokio_rate_limit.grpc.requests.allowed").increment(1);
+                if let Some(remaining) = decision.remaining {
+                    metrics::histogram!("tokio_rate_limit.grpc.remaining_tokens")
+                        .record(remaining as f64);
+                }
+            }
+
+            let clone = self.inner.clone();
+            let mut inner = std::mem::replace(&mut self.inner, clone);
+            GrpcRateLimitFuture {
+                state: GrpcFutureState::PassThrough {
+                    future: inner.call(req),
+                    decision: Some(decision),
+                },
+            }
+        } else {
+            #[cfg(feature = "metrics-support")]
+            {
+                metrics::counter!("tokio_rate_limit.grpc.requests.denied").increment(1);
+                if let Some(remaining) = decision.remaining {
+                    metrics::histogram!("tokio_rate_limit.grpc.remaining_tokens")
+                        .record(remaining as f64);
+                }
+            }
+
+            GrpcRateLimitFuture {
+                state: GrpcFutureState::Immediate {
+                    response: Some(self.rejection_handler.reject(&decision)),
+                },
+            }
+        }
     }
 }
 
-/// Adds rate limit information to the response as gRPC trailers.
-///
-/// gRPC uses HTTP/2 trailers to send metadata after the response body.
-/// This function adds rate limit information that clients can inspect.
-fn add_rate_limit_trailer(
+/// Adds rate limit metadata to initial HTTP/2 response headers (accessible on Tonic
+/// clients via `response.metadata()`).
+fn add_rate_limit_metadata(
     mut response: http::Response<Body>,
     decision: &RateLimitDecision,
 ) -> http::Response<Body> {
     let headers = response.headers_mut();
 
-    // Add rate limit information as headers (will become trailers in gRPC)
-    headers.insert(
-        "x-ratelimit-limit",
-        decision.limit.to_string().parse().unwrap(),
-    );
+    headers.insert(HDR_X_RATELIMIT_LIMIT, HeaderValue::from(decision.limit));
 
     if let Some(remaining) = decision.remaining {
-        headers.insert(
-            "x-ratelimit-remaining",
-            remaining.to_string().parse().unwrap(),
-        );
+        headers.insert(HDR_X_RATELIMIT_REMAINING, HeaderValue::from(remaining));
     }
 
     if let Some(reset) = decision.reset {
         headers.insert(
-            "x-ratelimit-reset",
-            http_seconds_ceil(reset).to_string().parse().unwrap(),
+            HDR_X_RATELIMIT_RESET,
+            HeaderValue::from(http_seconds_ceil(reset)),
         );
     }
 
     response
 }
 
-/// Creates a gRPC error response with RESOURCE_EXHAUSTED status.
+/// Converts a [`tonic::Status`] into a spec-compliant gRPC over HTTP/2 response.
 ///
-/// According to gRPC specifications, RESOURCE_EXHAUSTED (code 8) is the
-/// appropriate status code for rate limiting. This indicates that some
-/// resource has been exhausted (in this case, the rate limit quota).
-///
-/// The response includes:
-/// - Status: RESOURCE_EXHAUSTED
-/// - Message: "Rate limit exceeded"
-/// - Metadata: Rate limit information (limit, remaining, retry-after)
-fn rate_limit_error_response(decision: &RateLimitDecision) -> http::Response<Body> {
-    let mut status = Status::resource_exhausted("Rate limit exceeded");
+/// Per the gRPC over HTTP/2 wire specification, gRPC responses MUST carry HTTP `:status 200`
+/// alongside `content-type: application/grpc` and `grpc-status: 8` (`RESOURCE_EXHAUSTED`).
+/// Returning HTTP `429` causes compliant gRPC clients and proxies to synthesize
+/// `Code::Unavailable` (14) instead of `Code::ResourceExhausted` (8).
+fn rate_limit_error_response(status: Status, decision: &RateLimitDecision) -> http::Response<Body> {
+    let mut response = status.into_http::<Body>();
+    let headers = response.headers_mut();
 
-    // Add rate limit metadata to the status
-    let metadata = status.metadata_mut();
-
-    if let Ok(value) = decision.limit.to_string().parse() {
-        metadata.insert("x-ratelimit-limit", value);
-    }
+    headers
+        .entry(HDR_X_RATELIMIT_LIMIT)
+        .or_insert_with(|| HeaderValue::from(decision.limit));
 
     if let Some(remaining) = decision.remaining {
-        if let Ok(value) = remaining.to_string().parse() {
-            metadata.insert("x-ratelimit-remaining", value);
-        }
+        headers
+            .entry(HDR_X_RATELIMIT_REMAINING)
+            .or_insert_with(|| HeaderValue::from(remaining));
     }
 
     if let Some(retry_after) = decision.retry_after {
-        if let Ok(value) = http_seconds_ceil(retry_after).to_string().parse() {
-            metadata.insert("retry-after", value);
-        }
+        headers
+            .entry(HDR_RETRY_AFTER)
+            .or_insert_with(|| HeaderValue::from(http_seconds_ceil(retry_after)));
     }
 
     if let Some(reset) = decision.reset {
-        if let Ok(value) = http_seconds_ceil(reset).to_string().parse() {
-            metadata.insert("x-ratelimit-reset", value);
-        }
+        headers
+            .entry(HDR_X_RATELIMIT_RESET)
+            .or_insert_with(|| HeaderValue::from(http_seconds_ceil(reset)));
     }
 
-    status.to_http()
-}
-
-/// Helper function to convert a tonic::Code to an http::StatusCode.
-///
-/// This is used internally by the error response generation.
-trait StatusExt {
-    fn to_http(self) -> http::Response<Body>;
-}
-
-impl StatusExt for Status {
-    fn to_http(self) -> http::Response<Body> {
-        let code = self.code();
-        let mut response = self.into_http::<Body>();
-        *response.status_mut() = code.to_http_status();
-        response
-    }
-}
-
-trait CodeExt {
-    fn to_http_status(&self) -> http::StatusCode;
-}
-
-impl CodeExt for Code {
-    fn to_http_status(&self) -> http::StatusCode {
-        match self {
-            Code::Ok => http::StatusCode::OK,
-            Code::Cancelled => http::StatusCode::from_u16(499).unwrap(), // Client Closed Request
-            Code::Unknown => http::StatusCode::INTERNAL_SERVER_ERROR,
-            Code::InvalidArgument => http::StatusCode::BAD_REQUEST,
-            Code::DeadlineExceeded => http::StatusCode::GATEWAY_TIMEOUT,
-            Code::NotFound => http::StatusCode::NOT_FOUND,
-            Code::AlreadyExists => http::StatusCode::CONFLICT,
-            Code::PermissionDenied => http::StatusCode::FORBIDDEN,
-            Code::ResourceExhausted => http::StatusCode::TOO_MANY_REQUESTS,
-            Code::FailedPrecondition => http::StatusCode::PRECONDITION_FAILED,
-            Code::Aborted => http::StatusCode::CONFLICT,
-            Code::OutOfRange => http::StatusCode::BAD_REQUEST,
-            Code::Unimplemented => http::StatusCode::NOT_IMPLEMENTED,
-            Code::Internal => http::StatusCode::INTERNAL_SERVER_ERROR,
-            Code::Unavailable => http::StatusCode::SERVICE_UNAVAILABLE,
-            Code::DataLoss => http::StatusCode::INTERNAL_SERVER_ERROR,
-            Code::Unauthenticated => http::StatusCode::UNAUTHORIZED,
-        }
-    }
+    response
 }
 
 #[cfg(test)]
@@ -515,7 +886,17 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::Arc;
     use std::task::{Context, Poll};
+    use tonic::Code;
+
+    fn assert_grpc_resource_exhausted(response: &http::Response<Body>) {
+        // gRPC over HTTP/2 wire spec requires HTTP 200 OK with grpc-status = 8
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let status = Status::from_header_map(response.headers())
+            .expect("headers-only gRPC status must decode");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+    }
 
     #[test]
     fn test_method_key_extractor() {
@@ -526,19 +907,7 @@ mod tests {
             .unwrap();
 
         let key = extractor.extract(&req);
-        assert_eq!(key, Some("helloworld.Greeter/SayHello".to_string()));
-    }
-
-    #[test]
-    fn test_method_key_extractor_no_leading_slash() {
-        let extractor = MethodKeyExtractor;
-        let req = http::Request::builder()
-            .uri("http://example.com/test.Service/Method")
-            .body(Body::default())
-            .unwrap();
-
-        let key = extractor.extract(&req);
-        assert_eq!(key, Some("test.Service/Method".to_string()));
+        assert_eq!(key, Some("helloworld.Greeter/SayHello"));
     }
 
     #[test]
@@ -551,7 +920,7 @@ mod tests {
             .unwrap();
 
         let key = extractor.extract(&req);
-        assert_eq!(key, Some("user-123".to_string()));
+        assert_eq!(key, Some("user-123"));
     }
 
     #[test]
@@ -575,21 +944,8 @@ mod tests {
             .body(Body::default())
             .unwrap();
 
-        let key = extractor.extract(&req);
-        assert_eq!(key, Some("10.0.0.1".to_string()));
-    }
-
-    #[test]
-    fn test_ip_key_extractor_single_ip() {
-        let extractor = IpKeyExtractor;
-        let req = http::Request::builder()
-            .uri("http://example.com/test")
-            .header("x-forwarded-for", "192.168.1.1")
-            .body(Body::default())
-            .unwrap();
-
-        let key = extractor.extract(&req);
-        assert_eq!(key, Some("192.168.1.1".to_string()));
+        let key = GrpcKeyExtractor::<String>::extract(&extractor, &req);
+        assert_eq!(key.as_deref(), Some("10.0.0.1"));
     }
 
     #[test]
@@ -601,8 +957,8 @@ mod tests {
             .body(Body::default())
             .unwrap();
 
-        let key = extractor.extract(&req);
-        assert_eq!(key, Some("10.0.0.1".to_string()));
+        let key = GrpcKeyExtractor::<String>::extract(&extractor, &req);
+        assert_eq!(key.as_deref(), Some("10.0.0.1"));
     }
 
     #[test]
@@ -613,7 +969,7 @@ mod tests {
             .body(Body::default())
             .unwrap();
 
-        let key = extractor.extract(&req);
+        let key = GrpcKeyExtractor::<String>::extract(&extractor, &req);
         assert_eq!(key, None);
     }
 
@@ -634,40 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_key_extractor_returns_none() {
-        let extractor = CustomGrpcKeyExtractor::new(|_req| None);
-
-        let req = http::Request::builder()
-            .uri("http://example.com/test")
-            .body(Body::default())
-            .unwrap();
-
-        let key = extractor.extract(&req);
-        assert_eq!(key, None);
-    }
-
-    #[test]
-    fn test_code_to_http_status() {
-        use http::StatusCode;
-
-        assert_eq!(Code::Ok.to_http_status(), StatusCode::OK);
-        assert_eq!(
-            Code::ResourceExhausted.to_http_status(),
-            StatusCode::TOO_MANY_REQUESTS
-        );
-        assert_eq!(Code::NotFound.to_http_status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            Code::InvalidArgument.to_http_status(),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            Code::Unauthenticated.to_http_status(),
-            StatusCode::UNAUTHORIZED
-        );
-    }
-
-    #[test]
-    fn test_rate_limit_error_response() {
+    fn test_rate_limit_error_response_grpc_wire_compliant() {
         let decision = crate::RateLimitDecision {
             permitted: false,
             limit: 100,
@@ -676,20 +999,10 @@ mod tests {
             retry_after: Some(std::time::Duration::from_secs(1)),
         };
 
-        let response = rate_limit_error_response(&decision);
+        let response =
+            rate_limit_error_response(Status::resource_exhausted("Rate limit exceeded"), &decision);
 
-        // Check status code
-        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
-
-        // Check grpc-status header
-        let grpc_status = response
-            .headers()
-            .get("grpc-status")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<i32>().ok());
-        assert_eq!(grpc_status, Some(Code::ResourceExhausted as i32));
-
-        // Check rate limit headers
+        assert_grpc_resource_exhausted(&response);
         assert_eq!(
             response
                 .headers()
@@ -714,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_rate_limit_trailer() {
+    fn test_add_rate_limit_metadata() {
         let decision = crate::RateLimitDecision {
             permitted: true,
             limit: 100,
@@ -724,7 +1037,7 @@ mod tests {
         };
 
         let response = http::Response::new(Body::default());
-        let response = add_rate_limit_trailer(response, &decision);
+        let response = add_rate_limit_metadata(response, &decision);
 
         assert_eq!(
             response
@@ -749,15 +1062,8 @@ mod tests {
         );
     }
 
-    // Mock service for testing
     #[derive(Clone)]
     struct MockService;
-
-    impl MockService {
-        fn new() -> Self {
-            Self
-        }
-    }
 
     impl Service<http::Request<Body>> for MockService {
         type Response = http::Response<Body>;
@@ -774,34 +1080,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rate_limit_service_allows_requests() {
-        let limiter = Arc::new(
-            RateLimiter::builder()
-                .requests_per_second(10)
-                .burst(20)
-                .build()
-                .unwrap(),
-        );
-
-        let layer = GrpcRateLimitLayer::new(limiter);
-        let mut service = layer.layer(MockService::new());
-
-        let req = http::Request::builder()
-            .uri("http://example.com/test.Service/Method")
-            .body(Body::default())
-            .unwrap();
-
-        let response = service.call(req).await.unwrap();
-        assert_eq!(response.status(), http::StatusCode::OK);
-
-        // Check for rate limit headers
-        assert!(response.headers().get("x-ratelimit-limit").is_some());
-        assert!(response.headers().get("x-ratelimit-remaining").is_some());
-    }
-
-    #[tokio::test]
-    async fn test_rate_limit_service_denies_requests() {
-        // Create a very restrictive rate limiter
+    async fn test_rate_limit_service_denies_with_grpc_resource_exhausted() {
         let limiter = Arc::new(
             RateLimiter::builder()
                 .requests_per_second(1)
@@ -811,45 +1090,37 @@ mod tests {
         );
 
         let layer = GrpcRateLimitLayer::new(limiter);
-        let mut service = layer.layer(MockService::new());
+        let mut service = layer.layer(MockService);
 
-        // First request should succeed
         let req = http::Request::builder()
             .uri("http://example.com/test.Service/Method")
             .body(Body::default())
             .unwrap();
-
         let response = service.call(req).await.unwrap();
         assert_eq!(response.status(), http::StatusCode::OK);
+        assert!(response.headers().get("grpc-status").is_none());
 
-        // Second immediate request should be rate limited
         let req = http::Request::builder()
             .uri("http://example.com/test.Service/Method")
             .body(Body::default())
             .unwrap();
-
         let response = service.call(req).await.unwrap();
-        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
-
-        // Check for rate limit headers
+        assert_grpc_resource_exhausted(&response);
         assert!(response.headers().get("x-ratelimit-limit").is_some());
         assert!(response.headers().get("retry-after").is_some());
     }
 
     #[tokio::test]
     async fn test_rate_limit_service_no_key_extracted() {
-        let limiter = Arc::new(
-            RateLimiter::builder()
-                .requests_per_second(1)
-                .burst(1)
-                .build()
-                .unwrap(),
-        );
+        let limiter = RateLimiter::builder()
+            .requests_per_second(1)
+            .burst(1)
+            .build()
+            .unwrap();
 
-        // Use a custom extractor that returns None
-        let extractor = CustomGrpcKeyExtractor::new(|_req| None);
+        let extractor = CustomGrpcKeyExtractor::new(|_req| None::<String>);
         let layer = GrpcRateLimitLayer::with_extractor(limiter, extractor);
-        let mut service = layer.layer(MockService::new());
+        let mut service = layer.layer(MockService);
 
         let req = http::Request::builder()
             .uri("http://example.com/test")
@@ -857,22 +1128,20 @@ mod tests {
             .unwrap();
 
         let response = service.call(req).await.unwrap();
-        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+        assert_grpc_resource_exhausted(&response);
     }
 
     #[tokio::test]
     async fn test_rate_limit_service_no_key_fail_open() {
-        let limiter = Arc::new(
-            RateLimiter::builder()
-                .requests_per_second(1)
-                .burst(1)
-                .build()
-                .unwrap(),
-        );
+        let limiter = RateLimiter::builder()
+            .requests_per_second(1)
+            .burst(1)
+            .build()
+            .unwrap();
 
-        let extractor = CustomGrpcKeyExtractor::new(|_req| None);
+        let extractor = CustomGrpcKeyExtractor::new(|_req| None::<String>);
         let layer = GrpcRateLimitLayer::with_extractor(limiter, extractor).fail_open();
-        let mut service = layer.layer(MockService::new());
+        let mut service = layer.layer(MockService);
 
         let req = http::Request::builder()
             .uri("http://example.com/test")
@@ -881,97 +1150,6 @@ mod tests {
 
         let response = service.call(req).await.unwrap();
         assert_eq!(response.status(), http::StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_rate_limit_service_custom_extractor() {
-        let limiter = Arc::new(
-            RateLimiter::builder()
-                .requests_per_second(1)
-                .burst(1)
-                .build()
-                .unwrap(),
-        );
-
-        // Custom extractor that combines method and user-id
-        let extractor = CustomGrpcKeyExtractor::new(|req| {
-            let method = req.uri().path().trim_start_matches('/');
-            let user = req.headers().get("user-id")?.to_str().ok()?;
-            Some(format!("{}:{}", method, user))
-        });
-
-        let layer = GrpcRateLimitLayer::with_extractor(limiter, extractor);
-        let mut service = layer.layer(MockService::new());
-
-        // Request with user-1
-        let req = http::Request::builder()
-            .uri("http://example.com/test.Service/Method")
-            .header("user-id", "user-1")
-            .body(Body::default())
-            .unwrap();
-
-        let response = service.call(req).await.unwrap();
-        assert_eq!(response.status(), http::StatusCode::OK);
-
-        // Second request with user-1 should be rate limited
-        let req = http::Request::builder()
-            .uri("http://example.com/test.Service/Method")
-            .header("user-id", "user-1")
-            .body(Body::default())
-            .unwrap();
-
-        let response = service.call(req).await.unwrap();
-        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
-
-        // Request with user-2 should be allowed (different key)
-        let req = http::Request::builder()
-            .uri("http://example.com/test.Service/Method")
-            .header("user-id", "user-2")
-            .body(Body::default())
-            .unwrap();
-
-        let response = service.call(req).await.unwrap();
-        assert_eq!(response.status(), http::StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_rate_limit_service_different_methods() {
-        let limiter = Arc::new(
-            RateLimiter::builder()
-                .requests_per_second(1)
-                .burst(1)
-                .build()
-                .unwrap(),
-        );
-
-        let layer = GrpcRateLimitLayer::new(limiter);
-        let mut service = layer.layer(MockService::new());
-
-        // Request to Method1
-        let req = http::Request::builder()
-            .uri("http://example.com/test.Service/Method1")
-            .body(Body::default())
-            .unwrap();
-
-        let response = service.call(req).await.unwrap();
-        assert_eq!(response.status(), http::StatusCode::OK);
-
-        // Second request to Method1 should be rate limited
-        let req = http::Request::builder()
-            .uri("http://example.com/test.Service/Method1")
-            .body(Body::default())
-            .unwrap();
-
-        let response = service.call(req).await.unwrap();
-        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
-
-        // Request to Method2 should be allowed (different key)
-        let req = http::Request::builder()
-            .uri("http://example.com/test.Service/Method2")
-            .body(Body::default())
-            .unwrap();
-
-        let response = service.call(req).await.unwrap();
-        assert_eq!(response.status(), http::StatusCode::OK);
+        assert!(response.headers().get("grpc-status").is_none());
     }
 }

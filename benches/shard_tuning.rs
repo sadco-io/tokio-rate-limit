@@ -16,7 +16,7 @@ use std::time::Duration;
 /// Simulates the AtomicTokenState used in TokenBucket
 struct AtomicTokenState {
     tokens: AtomicU64,
-    last_refill_nanos: AtomicU64,
+    _last_refill_nanos: AtomicU64,
 }
 
 impl AtomicTokenState {
@@ -24,7 +24,7 @@ impl AtomicTokenState {
         const SCALE: u64 = 1000;
         Self {
             tokens: AtomicU64::new(capacity.saturating_mul(SCALE)),
-            last_refill_nanos: AtomicU64::new(0),
+            _last_refill_nanos: AtomicU64::new(0),
         }
     }
 

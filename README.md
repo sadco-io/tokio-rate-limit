@@ -132,11 +132,10 @@ coarsely and denies more than it should.
 - ❌ **NOT for strict compliance** (regulatory requirements)
 - ❌ **NOT when `capacity` is close to `sample_rate * cost`**
 
-**Algorithm Comparison (v0.8.0):**
-- **TokenBucket**: 57ns (deterministic, allows bursts, recommended default)
-- **ProbabilisticTokenBucket**: experimental; a few percent faster than `TokenBucket` on a hot key, at the cost of `sample_rate`-grained accuracy
-- **LeakyBucket**: 63ns (deterministic, stricter rate enforcement)
-- **CachedTokenBucket**: 59ns (thread-local caching, <1K hot keys)
+**Algorithm Comparison:**
+- **TokenBucket**: Deterministic single-atomic GCRA cell, allows bursts, recommended default
+- **ProbabilisticTokenBucket**: Sampled hot-key limiter; skips clock/CAS on unsampled admits at the cost of `sample_rate`-grained accuracy
+- **LeakyBucket**: Deterministic GCRA meter; set `capacity = 1` for strict burst-free pacing or `capacity > 1` for bounded queue tolerance
 
 **Observability Overhead (Optional Features):**
 - Baseline (no features): 18.5M ops/sec
@@ -199,17 +198,20 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tokio-rate-limit = "0.10"
+tokio-rate-limit = "0.11"
 
 # For Axum middleware support
-tokio-rate-limit = { version = "0.10", features = ["middleware"] }
+tokio-rate-limit = { version = "0.11", features = ["middleware"] }
 
 # For Tonic gRPC middleware support
-tokio-rate-limit = { version = "0.10", features = ["tonic-support"] }
+tokio-rate-limit = { version = "0.11", features = ["tonic-support"] }
 
-# For observability (tracing + metrics)
-tokio-rate-limit = { version = "0.10", features = ["middleware", "observability"] }
-tokio-rate-limit = { version = "0.10", features = ["middleware", "metrics-support"] }
+# For observability (independent feature flags)
+tokio-rate-limit = { version = "0.11", features = ["middleware", "observability"] }
+tokio-rate-limit = { version = "0.11", features = ["middleware", "metrics-support"] }
+
+# For Serde config & decision serialization
+tokio-rate-limit = { version = "0.11", features = ["serde"] }
 ```
 
 ### Basic Usage
@@ -315,17 +317,15 @@ let decision = limiter.try_acquire("user-123");
 ```rust
 use axum::{Router, routing::get};
 use tokio_rate_limit::{RateLimiter, middleware::RateLimitLayer};
-use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
-    let limiter = Arc::new(
-        RateLimiter::builder()
-            .requests_per_second(100)
-            .burst(200)
-            .build()
-            .unwrap()
-    );
+    // RateLimiter is cheaply Clone (backed by an internal Arc)
+    let limiter = RateLimiter::builder()
+        .requests_per_second(100)
+        .burst(200)
+        .build()
+        .unwrap();
 
     let app: Router = Router::new()
         .route("/api/data", get(handler))
@@ -373,30 +373,33 @@ Retry-After: 8
 
 ### Custom Key Extraction
 
-Rate limit by user ID, API key, or any custom logic:
+Rate limit by user ID, API key, or any custom logic (zero-allocation header extraction included):
 
 ```rust
-use tokio_rate_limit::middleware::{RateLimitLayer, CustomKeyExtractor};
+use tokio_rate_limit::middleware::{RateLimitLayer, HeaderKeyExtractor, CustomKeyExtractor};
 use axum::{body::Body, extract::Request};
 
-let limiter = Arc::new(
-    RateLimiter::builder()
-        .requests_per_second(50)
-        .burst(100)
-        .build()
-        .unwrap()
-);
+let limiter = RateLimiter::builder()
+    .requests_per_second(50)
+    .burst(100)
+    .build()
+    .unwrap();
 
-// Extract user ID from header
+// Zero-allocation header key extraction
 let app: Router = Router::new()
+    .route("/api/secure", get(handler))
+    .layer(RateLimitLayer::with_extractor(
+        limiter.clone(),
+        HeaderKeyExtractor::from_static("x-api-key"),
+    ));
+
+// Or custom closure extraction
+let custom_app: Router = Router::new()
     .route("/api/user-data", get(handler))
     .layer(RateLimitLayer::with_extractor(
         limiter,
-        CustomKeyExtractor::new(|req: &Request<Body>| {
-            req.headers()
-                .get("X-User-Id")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
+        CustomKeyExtractor::borrowed(|req: &Request<Body>| {
+            req.headers().get("x-user-id")?.to_str().ok()
         }),
     ));
 ```
@@ -452,15 +455,15 @@ GrpcRateLimitLayer::with_extractor(
 ```
 
 **Features:**
-- Minimal overhead (<300ns per request)
-- Proper gRPC status codes (RESOURCE_EXHAUSTED on limit exceeded)
-- Rate limit metadata in response trailers
-- Multiple key extraction strategies
-- Seamless Tower integration
+- Minimal overhead with unboxed response futures and zero-allocation key extraction
+- Spec-compliant gRPC over HTTP/2 wire status (`:status 200` + `grpc-status: 8` `RESOURCE_EXHAUSTED`)
+- Per-RPC cost weighting (`.with_cost(...)`) and custom `Status` handlers (`.on_rejected(...)`)
+- Rate limit metadata in initial headers and error trailers
+- Seamless stateful Tower layer composition (`ConcurrencyLimit`, `Buffer`, etc.)
 
 **Enable with feature flag:**
 ```toml
-tokio-rate-limit = { version = "0.10", features = ["tonic-support"] }
+tokio-rate-limit = { version = "0.11", features = ["tonic-support"] }
 ```
 
 ## Algorithms *(NEW in v0.3.0)*
@@ -497,13 +500,12 @@ let limiter = RateLimiter::builder()
 
 ### Leaky Bucket *(NEW in v0.3.0)*
 
-The leaky bucket algorithm enforces a steady rate by "leaking" tokens at a constant rate.
+The leaky bucket algorithm acts as a GCRA meter that drains accumulated occupancy at a constant rate.
 
 **Characteristics:**
-- Enforces strict steady rate, no bursts
-- Smooths traffic into consistent flow
-- Requests add tokens to bucket; overflow = deny
-- More predictable load on downstream services
+- Set `capacity = 1` for strict burst-free inter-arrival pacing (`1 / leak_rate` between requests)
+- Set `capacity > 1` for bounded queue/jitter tolerance up to `capacity` tokens
+- Requests add occupancy to the meter; overflow is denied with exact `retry_after`
 
 **Best For:**
 - Backend protection and rate smoothing
@@ -516,23 +518,24 @@ The leaky bucket algorithm enforces a steady rate by "leaking" tokens at a const
 use tokio_rate_limit::RateLimiter;
 use tokio_rate_limit::algorithm::LeakyBucket;
 
-// Leaky bucket: capacity 50, leak rate 100/sec
-let algorithm = LeakyBucket::new(50, 100);
-let limiter = RateLimiter::from_algorithm(algorithm);
+// Strict burst-free pacing at 100 req/sec (10ms spacing):
+let strict = RateLimiter::from_algorithm(LeakyBucket::new(1, 100));
+
+// Meter with bounded burst tolerance of 50 at 100 req/sec:
+let smoothed = RateLimiter::from_algorithm(LeakyBucket::new(50, 100));
 ```
 
 ### Comparison
 
-| Feature | Token Bucket | Leaky Bucket |
-|---------|--------------|--------------|
-| **Bursts** | ✅ Allowed (up to capacity) | ❌ Not allowed |
-| **Rate Enforcement** | Average over time | Strict steady rate |
+| Feature | Token Bucket | Leaky Bucket (`capacity = 1`) |
+|---------|--------------|-------------------------------|
+| **Bursts** | ✅ Allowed (up to capacity) | ❌ Strictly paced |
+| **Rate Enforcement** | Average over time | Exact inter-arrival spacing |
 | **Traffic Pattern** | Bursty | Smooth |
 | **Best For** | Public APIs, users | Backend protection |
 | **Predictability** | Moderate | High |
-| **Performance** | 17.5M ops/sec (v0.8.0) | 15.9M ops/sec (v0.8.0) |
 
-Both algorithms are virtually identical in performance (within 3-7%). See [ALGORITHM_BENCHMARKS.md](ALGORITHM_BENCHMARKS.md) for detailed benchmark results.
+Both deterministic algorithms share the same single-atomic GCRA cell implementation. Run `cargo bench --bench algorithm_comparison` on your hardware for comparative benchmarks.
 
 **When to Choose:**
 
@@ -577,10 +580,10 @@ Enable distributed tracing and metrics for production debugging:
 
 ```toml
 # Cargo.toml
-tokio-rate-limit = { version = "0.10", features = ["middleware", "observability"] }
+tokio-rate-limit = { version = "0.11", features = ["middleware", "observability"] }
 
-# For metrics collection
-tokio-rate-limit = { version = "0.10", features = ["middleware", "metrics-support"] }
+# For metrics collection (independent of tracing)
+tokio-rate-limit = { version = "0.11", features = ["middleware", "metrics-support"] }
 ```
 
 ### Distributed Tracing
@@ -631,7 +634,7 @@ PrometheusBuilder::new()
 - **observability:** ~8-19% in microbenchmarks, <0.001% in real HTTP workloads
 - **metrics-support:** ~18-34% in microbenchmarks, <0.001% in real HTTP workloads
 
-See [OBSERVABILITY.md](OBSERVABILITY.md) for comprehensive integration guide with OpenTelemetry, Jaeger, Prometheus, and production best practices.
+See [`examples/observability.rs`](examples/observability.rs) for working tracing and metrics integration examples.
 
 ## Examples
 
@@ -668,84 +671,36 @@ cargo run --example leaky_bucket
 
 ## How It Works
 
-### Token Bucket Algorithm
+### Single-Atomic GCRA Token Accounting
 
-The library uses a token bucket algorithm for rate limiting:
+Deterministic `TokenBucket` and `LeakyBucket` represent each key's entire quota schedule as a single `AtomicU64` **Theoretical Arrival Time (TAT)** in nanoseconds relative to limiter creation:
 
-- **Bucket Capacity**: Maximum burst size (e.g., 200 tokens)
-- **Refill Rate**: Tokens added per second (e.g., 100 tokens/sec)
-- **Per-Key Buckets**: Each client/user/key has an independent bucket
-- **Lock-Free Token Accounting**: Uses atomic operations for token updates without locks
-- **Lock-Free State Management**: flurry provides lock-free concurrent hashmap for key lookup
-
-When a request arrives:
-1. Calculate tokens to refill based on elapsed time
-2. Attempt to consume `cost` tokens via compare-and-swap (lock-free)
-3. If successful, allow the request
-4. If bucket is empty, deny and return retry-after duration
-5. Calculate reset time (when bucket will be full)
-
-### Architectural Highlights
-
-- **flurry**: Lock-free concurrent hashmap (Java ConcurrentHashMap port) for per-key token buckets
-- **Lock-Free Token Updates**: Atomic compare-and-swap operations on token counts
-- **Auto-Tuning**: flurry automatically tunes internal parameters for optimal performance
-- **Precision**: 1000x scaling factor for sub-token precision
-- **Zero Allocations**: Hot path avoids heap allocations
-
-The entire hot path is lock-free, using atomic operations for both token accounting and key access.
-
-## Performance Tuning
-
-As of v0.2.0, the library uses flurry's lock-free concurrent hashmap which automatically tunes its internal parameters for optimal performance across different workloads and thread counts. No manual tuning is required.
-
-**Performance improvements in v0.2.0:**
-- **Single-threaded:** +19% improvement over DashMap
-- **2 threads:** +66% improvement over DashMap
-- **4 threads:** +69% improvement over DashMap
-- **8 threads:** +117% improvement over DashMap
-- **16 threads:** +40% improvement over DashMap
-
-The `with_shard_count()` method is now deprecated and internally calls the standard constructor, as flurry does not expose shard configuration.
-
-## Comparison with Governor
-
-| Feature | tokio-rate-limit | governor |
-|---------|------------------|----------|
-| **Use Case** | Per-key rate limiting | Global rate limiting |
-| **Performance** | 17.5M ops/sec deterministic (v0.8.0) | 357M ops/sec (global) |
-| **Key Management** | Built-in per-key tracking | Manual key management |
-| **Middleware** | Axum integration included | DIY middleware |
-| **Algorithm** | Pluggable (token bucket default) | GCRA algorithm |
-| **Standards** | IETF RateLimit headers | Custom headers |
-| **Cost-Based** | ✅ Built-in | ❌ Not supported |
-| **Observability** | ✅ Optional tracing/metrics | ❌ Manual |
-
-**When to use tokio-rate-limit:**
-- You need per-client/per-user/per-IP rate limits
-- You want drop-in Axum middleware
-- You need custom key extraction logic
-- You want cost-based/weighted rate limiting
-- You need IETF-compliant headers
-- You want optional observability
-
-**When to use governor:**
-- You need a single global rate limit
-- You want maximum single-limiter performance
-- You prefer the GCRA algorithm
-
-Both libraries are excellent choices depending on your use case!
+- **Single CAS per check**: Eliminates the two-atomic race between timestamp claiming and token debiting under multi-thread contention.
+- **256 OS-Seeded Shards**: Keys are hashed once with per-instance OS-seeded `ahash` and routed across 256 independent lock-free `flurry` maps (DoS-resistant against crafted shard collisions).
+- **Non-Blocking TTL Eviction**: Background-free round-robin 16-shard sweeps guarded by `AtomicBool` never stall concurrent callers and never evict still-penalized keys before their quota has recovered.
+- **Zero Hot-Path Allocations**: Existing keys borrow `&str` (or typed `&K`) directly on lookup, format peer IPs onto a stack buffer, and serialize HTTP integer headers without `format!()`.
 
 ## Feature Flags
 
-- `middleware` - Enables Axum middleware support (adds `axum` and `tower` dependencies)
-- `tonic-support` - Enables Tonic gRPC middleware support (adds `tonic`, `tower`, `http` dependencies) *(NEW in v0.5.0)*
-- `observability` - Enables distributed tracing via `tracing` crate *(NEW in v0.2.0)*
-- `metrics-support` - Enables metrics collection via `metrics` crate (implies `observability`) *(NEW in v0.2.0)*
+- `middleware` - Enables Axum/Tower HTTP middleware (`RateLimitLayer`, `HeaderKeyExtractor`, `IpKeyExtractor`, `CustomKeyExtractor`)
+- `tonic-support` - Enables Tonic gRPC middleware (`GrpcRateLimitLayer`, `MethodKeyExtractor`, `MetadataKeyExtractor`, `IpKeyExtractor`) *(requires Rust 1.88+)*
+- `observability` - Enables `tracing` instrumentation on limiter checks
+- `metrics-support` - Enables `metrics` counters and histograms on `RateLimiter` and middleware (independent of `observability`)
+- `serde` - Derives `Serialize` and `Deserialize` on `RateLimiterConfig` and `RateLimitDecision`
 
 ## API Documentation
 
 Full API documentation is available at [docs.rs/tokio-rate-limit](https://docs.rs/tokio-rate-limit).
+
+## What's New in v0.11.0
+
+- **Spec-compliant gRPC wire responses**: `GrpcRateLimitLayer` now returns HTTP `200 OK` with `grpc-status: 8` (`Code::ResourceExhausted`) via `tonic::Status::into_http()` instead of HTTP `429` (which Tonic clients decoded as `Code::Unavailable`).
+- **Single-atomic GCRA cell (`AtomicTatState`)**: `TokenBucket` and `LeakyBucket` now use a single `AtomicU64` Theoretical Arrival Time CAS — eliminating contended refill-claim races, shrinking per-key state, and putting `LeakyBucket` on the same 256-shard OS-seeded `ahash` map.
+- **Generic typed keys (`K: RateLimitKey`)**: Rate limit directly by `IpAddr`, `u64`, `UUID`, `(TenantId, RouteId)`, or `Arc<str>` via `.build_with_key::<K>()` with zero string formatting.
+- **Sub-1-req/s rates & tight bursts**: Added `.per_minute(n)`, `.per_hour(n)`, `.replenish_interval(d)`, and `.idle_ttl(d)` on `RateLimiterBuilder`, and lifted the `burst >= requests_per_second` restriction.
+- **State introspection & management**: Added `peek`, `reset`, `clear`, `len`, `is_empty`, and deterministic `cleanup` on `RateLimiter` and `Algorithm`.
+- **Middleware upgrades**: Unboxed response futures, Tower `poll_ready` readiness handoff fix (`std::mem::replace`), zero-allocation `HeaderKeyExtractor`, borrowed gRPC key extractors, `.with_cost(...)`, and `.on_rejected(...)` on both HTTP and gRPC layers.
+- **Ergonomics & cleanup**: `RateLimiter` now implements `Clone` + `Debug` directly (no outer `Arc` required), `cost > capacity` returns `retry_after: None` immediately without hanging `acquire_with_cost`, `metrics-support` works on direct `RateLimiter::check` calls without pulling `tracing`, optional `serde` support, and deprecated `CachedTokenBucket` / `with_shard_count` removed.
 
 ## What's New in v0.10.0
 
@@ -764,11 +719,11 @@ This crate requires Rust 1.85.0 or later (`tonic-support` needs 1.88).
 
 ## Performance Tips
 
-1. **Reuse RateLimiter instances**: Create once, use many times (wrap in `Arc`)
-2. **Choose appropriate burst sizes**: Burst should be ≥ requests_per_second
-3. **Key length**: Shorter keys perform better (IP addresses are fine)
-4. **TTL for high-cardinality keys**: Use `TokenBucket::with_ttl()` when you have millions of unique keys
-5. **Observability**: Enable only in production where the operational benefits outweigh the minimal overhead
+1. **Clone `RateLimiter` freely**: `RateLimiter` wraps an internal `Arc` (`Clone` is a cheap pointer bump)
+2. **Use typed keys on hot paths**: `.build_with_key::<IpAddr>()` or `.build_with_key::<u64>()` skips string allocation entirely
+3. **Prefer borrowed key extractors**: `HeaderKeyExtractor`, `IpKeyExtractor`, `MethodKeyExtractor`, and `CustomKeyExtractor::borrowed` perform zero heap allocations on existing keys
+4. **TTL for high-cardinality keys**: Use `.idle_ttl(Duration::from_secs(3600))` when you have millions of ephemeral keys
+5. **Observability**: Enable `observability` and/or `metrics-support` independently as needed in production
 
 ## Testing
 

@@ -26,7 +26,7 @@ const WINDOW: Duration = Duration::from_secs(10);
 const RUNS: usize = 100;
 
 /// Drives `algorithm` at a fixed offered rate over a virtual window.
-async fn drive<A: Algorithm>(
+async fn drive<A: Algorithm<Key = String>>(
     algorithm: &A,
     key: &str,
     offered_per_sec: u64,

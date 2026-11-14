@@ -1,164 +1,43 @@
 //! Leaky bucket rate limiting algorithm implementation.
 
 use crate::algorithm::internal::{
-    nanos_for_tokens, refill_tokens, should_cleanup, wait_for_tokens, zero_cost_decision, SCALE,
+    duration_to_nanos_sat, zero_cost_decision, AtomicTatState, ShardedMap, TatParams,
+    MAX_TAT_BURST, MAX_TAT_RATE_PER_SEC,
 };
-use crate::algorithm::Algorithm;
+use crate::algorithm::{Algorithm, RateLimitKey, ToKey};
 use crate::limiter::RateLimitDecision;
-use flurry::HashMap as FlurryHashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::borrow::Borrow;
+use std::fmt;
+use std::hash::Hash;
+use std::marker::PhantomData;
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// Maximum capacity to prevent overflow in scaled arithmetic.
-const MAX_CAPACITY: u64 = u64::MAX / (2 * SCALE);
+/// Maximum capacity (`u64::MAX / 2`).
+const MAX_CAPACITY: u64 = MAX_TAT_BURST;
 
-/// Maximum leak rate per second to prevent overflow.
-const MAX_LEAK_RATE: u64 = u64::MAX / (2 * SCALE);
+/// Maximum leak rate per second (`1_000_000_000`).
+const MAX_LEAK_RATE: u64 = MAX_TAT_RATE_PER_SEC;
 
-/// Atomic state for a leaky bucket.
+/// Mask for amortized round-robin shard cleanup (`1` in `16` checks sweeps `16` shards).
+const CLEANUP_SAMPLE_MASK: u64 = 15;
+
+/// Leaky bucket (as a meter) rate limiting algorithm.
 ///
-/// Unlike token bucket which allows bursts, leaky bucket enforces a steady rate
-/// by "leaking" tokens at a constant rate. Requests add tokens to the bucket,
-/// and if the bucket would overflow, the request is denied.
-struct AtomicLeakyState {
-    /// Current number of tokens in the bucket (scaled by 1000 for sub-token precision)
-    /// Lower is better - represents pending requests that haven't "leaked" yet
-    tokens: AtomicU64,
-
-    /// Last leak timestamp in nanoseconds since the tokio runtime started
-    last_leak_nanos: AtomicU64,
-
-    /// Last access timestamp in nanoseconds, used for TTL-based eviction
-    last_access_nanos: AtomicU64,
-}
-
-impl AtomicLeakyState {
-    /// Creates a new leaky bucket state starting empty.
-    fn new(now_nanos: u64) -> Self {
-        Self {
-            tokens: AtomicU64::new(0), // Start empty
-            last_leak_nanos: AtomicU64::new(now_nanos),
-            last_access_nanos: AtomicU64::new(now_nanos),
-        }
-    }
-
-    /// Attempts to add tokens to the bucket (i.e., make a request).
-    ///
-    /// This method performs automatic leaking based on elapsed time and uses
-    /// lock-free compare-and-swap loops for token updates.
-    ///
-    /// # Arguments
-    ///
-    /// * `capacity` - Maximum bucket capacity (water level)
-    /// * `leak_rate_per_second` - Rate at which tokens leak out
-    /// * `now_nanos` - Current time in nanoseconds
-    /// * `cost` - Number of tokens to add (request cost)
-    ///
-    /// Returns `(permitted, remaining_capacity)`
-    fn try_add(
-        &self,
-        capacity: u64,
-        leak_rate_per_second: u64,
-        now_nanos: u64,
-        cost: u64,
-    ) -> (bool, u64) {
-        self.last_access_nanos.store(now_nanos, Ordering::Relaxed);
-
-        let scaled_capacity = capacity.saturating_mul(SCALE);
-        let token_cost = cost.saturating_mul(SCALE);
-        let rate_scaled = leak_rate_per_second.saturating_mul(SCALE);
-
-        self.apply_leak(rate_scaled, now_nanos);
-
-        loop {
-            let current = self.tokens.load(Ordering::Relaxed);
-            let new_tokens = current.saturating_add(token_cost);
-            if new_tokens > scaled_capacity {
-                let remaining_capacity = scaled_capacity.saturating_sub(current) / SCALE;
-                return (false, remaining_capacity);
-            }
-            match self.tokens.compare_exchange_weak(
-                current,
-                new_tokens,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    let remaining_capacity = scaled_capacity.saturating_sub(new_tokens) / SCALE;
-                    return (true, remaining_capacity);
-                }
-                Err(_) => continue,
-            }
-        }
-    }
-
-    /// Claim the elapsed interval, then subtract leaked occupancy.
-    fn apply_leak(&self, rate_scaled: u64, now_nanos: u64) {
-        loop {
-            let last = self.last_leak_nanos.load(Ordering::Relaxed);
-            let leaked = refill_tokens(now_nanos.saturating_sub(last), rate_scaled);
-            if leaked == 0 {
-                return;
-            }
-            let claimed = nanos_for_tokens(leaked, rate_scaled);
-            if self
-                .last_leak_nanos
-                .compare_exchange_weak(
-                    last,
-                    last.saturating_add(claimed),
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
-                .is_err()
-            {
-                continue;
-            }
-            let _ = self
-                .tokens
-                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
-                    Some(current.saturating_sub(leaked))
-                });
-            return;
-        }
-    }
-}
-
-/// Leaky bucket rate limiting algorithm.
+/// Implements the ITU-T I.371 / ATM Forum Generic Cell Rate Algorithm (GCRA)
+/// leaky-bucket-as-a-meter traffic policer over 256 lock-free shards.
 ///
-/// The leaky bucket algorithm enforces a steady rate by "leaking" tokens at a constant rate.
-/// Unlike token bucket which allows bursts, leaky bucket smooths traffic by maintaining
-/// a consistent flow rate.
+/// Each key starts empty (`0` water level, `capacity` remaining space). Incoming
+/// requests add `cost` units of water; water drains continuously at `leak_rate_per_second`.
+/// If adding `cost` would exceed `capacity`, the request is rejected without modifying
+/// the bucket and `retry_after` reports the exact duration until enough water drains
+/// to accommodate `cost`.
 ///
-/// # Algorithm Details
+/// # Pacing vs Tolerance
 ///
-/// - **Capacity**: Maximum bucket size (water level)
-/// - **Leak Rate**: Tokens removed per second (steady outflow)
-/// - **Request Handling**: Each request adds tokens; if bucket overflows, request is denied
-/// - **Traffic Smoothing**: Enforces steady rate without bursts
-///
-/// # Comparison with Token Bucket
-///
-/// | Feature | Token Bucket | Leaky Bucket |
-/// |---------|--------------|--------------|
-/// | **Bursts** | Allowed up to capacity | Not allowed |
-/// | **Rate Enforcement** | Average rate over time | Strict steady rate |
-/// | **Traffic Pattern** | Bursty | Smooth |
-/// | **Use Case** | Public APIs, user requests | Backend protection, QPS limits |
-///
-/// # Use Cases
-///
-/// - **Backend Protection**: Prevent overwhelming downstream services with consistent load
-/// - **Strict QPS Enforcement**: When you need exactly N requests/sec, no more, no less
-/// - **Traffic Smoothing**: Convert bursty traffic into steady stream
-/// - **Fair Queuing**: Ensure no client can monopolize resources with bursts
-///
-/// # Performance
-///
-/// - Uses same lock-free architecture as TokenBucket
-/// - Expected: Similar performance to TokenBucket (15M+ ops/sec single-threaded)
-/// - Minimal overhead compared to token bucket
+/// - Setting `capacity = 1` enforces strict zero-burst inter-arrival spacing (`1 / leak_rate`).
+/// - Setting `capacity > 1` allows up to `capacity` queued units before overflow while
+///   enforcing the long-term `leak_rate_per_second` ceiling.
 ///
 /// # Examples
 ///
@@ -166,173 +45,232 @@ impl AtomicLeakyState {
 /// use tokio_rate_limit::algorithm::LeakyBucket;
 /// use tokio_rate_limit::RateLimiter;
 ///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// // 100 requests/sec steady rate, capacity of 50
 /// let algorithm = LeakyBucket::new(50, 100);
 /// let limiter = RateLimiter::from_algorithm(algorithm);
-///
-/// // Requests that would cause bursts are denied
 /// let decision = limiter.check("client-123");
-/// # Ok(())
-/// # }
+/// assert!(decision.permitted);
 /// ```
-pub struct LeakyBucket {
-    /// Maximum tokens the bucket can hold
-    capacity: u64,
-
-    /// Number of tokens leaked per second (steady rate)
+pub struct LeakyBucket<K: RateLimitKey = String> {
+    params: TatParams,
     leak_rate_per_second: u64,
-
-    /// Reference instant for time measurements.
     reference_instant: Instant,
-
-    /// Time-to-live for idle keys.
     idle_ttl: Option<Duration>,
-
-    /// Per-key leaky bucket state.
-    buckets: Arc<FlurryHashMap<String, Arc<AtomicLeakyState>>>,
+    shards: ShardedMap<K, AtomicTatState>,
+    _key: PhantomData<fn() -> K>,
 }
 
-impl LeakyBucket {
-    /// Creates a new leaky bucket with the specified capacity and leak rate.
-    ///
-    /// # Arguments
-    ///
-    /// * `capacity` - Maximum bucket size, clamped to MAX_CAPACITY if exceeded
-    /// * `leak_rate_per_second` - Tokens leaked per second, clamped to MAX_LEAK_RATE if exceeded
+impl LeakyBucket<String> {
+    /// Creates a new `String`-keyed leaky bucket with the specified capacity and leak rate.
     ///
     /// # Examples
     ///
     /// ```
-    /// use tokio_rate_limit::algorithm::LeakyBucket;
+    /// use tokio_rate_limit::algorithm::{Algorithm, LeakyBucket};
     ///
-    /// // 100 requests/sec with capacity of 50
     /// let bucket = LeakyBucket::new(50, 100);
+    /// assert!(bucket.check("client-1").permitted);
     /// ```
     pub fn new(capacity: u64, leak_rate_per_second: u64) -> Self {
+        Self::new_with_key(capacity, leak_rate_per_second)
+    }
+
+    /// Creates a new `String`-keyed leaky bucket with TTL-based idle eviction.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use tokio_rate_limit::algorithm::{Algorithm, LeakyBucket};
+    ///
+    /// let bucket = LeakyBucket::with_ttl(50, 100, Duration::from_secs(3600));
+    /// assert!(bucket.check("client-1").permitted);
+    /// ```
+    pub fn with_ttl(capacity: u64, leak_rate_per_second: u64, idle_ttl: Duration) -> Self {
+        Self::with_ttl_and_key(capacity, leak_rate_per_second, idle_ttl)
+    }
+
+    /// Creates a new `String`-keyed leaky bucket with an exact per-unit leak interval.
+    pub fn with_period(capacity: u64, leak_interval: Duration) -> Self {
+        Self::with_period_and_key(capacity, leak_interval)
+    }
+
+    /// Creates a new `String`-keyed leaky bucket with an exact per-unit leak interval and idle TTL.
+    pub fn with_period_and_ttl(capacity: u64, leak_interval: Duration, idle_ttl: Duration) -> Self {
+        Self::with_period_and_ttl_and_key(capacity, leak_interval, idle_ttl)
+    }
+}
+
+impl<K: RateLimitKey> LeakyBucket<K> {
+    /// Creates a leaky bucket keyed by an arbitrary [`RateLimitKey`] type `K`.
+    pub fn new_with_key(capacity: u64, leak_rate_per_second: u64) -> Self {
         let safe_capacity = capacity.min(MAX_CAPACITY);
         let safe_rate = leak_rate_per_second.min(MAX_LEAK_RATE);
-
+        let (params, _, _) = TatParams::from_rate_per_sec(safe_capacity, safe_rate);
         Self {
-            capacity: safe_capacity,
+            params,
             leak_rate_per_second: safe_rate,
             reference_instant: Instant::now(),
             idle_ttl: None,
-            buckets: Arc::new(FlurryHashMap::new()),
+            shards: ShardedMap::new(),
+            _key: PhantomData,
         }
     }
 
-    /// Creates a new leaky bucket with TTL-based eviction.
-    ///
-    /// # Arguments
-    ///
-    /// * `capacity` - Maximum bucket size
-    /// * `leak_rate_per_second` - Tokens leaked per second
-    /// * `idle_ttl` - Duration after which idle keys are evicted
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use tokio_rate_limit::algorithm::LeakyBucket;
-    /// use std::time::Duration;
-    ///
-    /// // Evict keys idle for more than 1 hour
-    /// let bucket = LeakyBucket::with_ttl(50, 100, Duration::from_secs(3600));
-    /// ```
-    pub fn with_ttl(capacity: u64, leak_rate_per_second: u64, idle_ttl: Duration) -> Self {
-        let mut bucket = Self::new(capacity, leak_rate_per_second);
+    /// Creates a generic-keyed leaky bucket with TTL-based idle eviction.
+    pub fn with_ttl_and_key(capacity: u64, leak_rate_per_second: u64, idle_ttl: Duration) -> Self {
+        let mut bucket = Self::new_with_key(capacity, leak_rate_per_second);
         bucket.idle_ttl = Some(idle_ttl);
         bucket
     }
 
-    /// Get current time in nanoseconds since the reference instant.
-    #[inline]
-    fn now_nanos(&self) -> u64 {
-        self.reference_instant.elapsed().as_nanos() as u64
-    }
-
-    /// Cleanup idle keys based on TTL configuration.
-    fn cleanup_idle(&self, now_nanos: u64) {
-        if let Some(ttl) = self.idle_ttl {
-            let ttl_nanos = ttl.as_nanos() as u64;
-
-            let guard = self.buckets.guard();
-            let keys_to_remove: Vec<String> = self
-                .buckets
-                .iter(&guard)
-                .filter_map(|(key, state)| {
-                    let last_access = state.last_access_nanos.load(Ordering::Relaxed);
-                    let age = now_nanos.saturating_sub(last_access);
-                    if age >= ttl_nanos {
-                        Some(key.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            for key in keys_to_remove {
-                self.buckets.remove(&key, &guard);
-            }
+    /// Creates a generic-keyed leaky bucket with an exact per-unit leak interval.
+    pub fn with_period_and_key(capacity: u64, leak_interval: Duration) -> Self {
+        let params = TatParams::from_emission_interval(capacity, leak_interval);
+        let rate_approx = 1_000_000_000u64
+            .checked_div(params.emission_interval_nanos)
+            .unwrap_or(0);
+        Self {
+            params,
+            leak_rate_per_second: rate_approx,
+            reference_instant: Instant::now(),
+            idle_ttl: None,
+            shards: ShardedMap::new(),
+            _key: PhantomData,
         }
     }
 
-    fn check_impl(&self, key: &str, cost: u64) -> RateLimitDecision {
+    /// Creates a generic-keyed leaky bucket with an exact per-unit leak interval and idle TTL.
+    pub fn with_period_and_ttl_and_key(
+        capacity: u64,
+        leak_interval: Duration,
+        idle_ttl: Duration,
+    ) -> Self {
+        let mut bucket = Self::with_period_and_key(capacity, leak_interval);
+        bucket.idle_ttl = Some(idle_ttl);
+        bucket
+    }
+
+    /// Returns the configured bucket capacity.
+    #[inline]
+    pub fn capacity(&self) -> u64 {
+        self.params.capacity
+    }
+
+    /// Returns the configured per-unit leak interval, or `None` if rate is 0.
+    #[inline]
+    pub fn leak_interval(&self) -> Option<Duration> {
+        if self.params.emission_interval_nanos == 0 {
+            None
+        } else {
+            Some(Duration::from_nanos(self.params.emission_interval_nanos))
+        }
+    }
+
+    #[inline]
+    fn now_nanos(&self) -> u64 {
+        duration_to_nanos_sat(self.reference_instant.elapsed())
+    }
+
+    fn check_impl<Q>(&self, key: &Q, cost: u64) -> RateLimitDecision
+    where
+        K: Borrow<Q>,
+        Q: Hash + Ord + ToKey<K> + ?Sized,
+    {
         if cost == 0 {
-            return zero_cost_decision(self.capacity);
+            return zero_cost_decision(self.params.capacity);
         }
 
         let now = self.now_nanos();
-        if self.idle_ttl.is_some() && should_cleanup() {
-            self.cleanup_idle(now);
+
+        if cost > self.params.capacity {
+            let existing_tat = self.shards.with_existing(key, |state| state.raw_tat());
+            return self.params.unfulfillable_decision(existing_tat, now);
         }
 
-        let guard = self.buckets.guard();
-        let state = match self.buckets.get(key, &guard) {
-            Some(state) => state,
-            None => {
-                let new_state = Arc::new(AtomicLeakyState::new(now));
-                match self.buckets.try_insert(key.to_string(), new_state, &guard) {
-                    Ok(inserted) => inserted,
-                    Err(not_inserted) => not_inserted.current,
-                }
-            }
-        };
-
-        let (permitted, remaining_capacity) =
-            state.try_add(self.capacity, self.leak_rate_per_second, now, cost);
-
-        let retry_after = if !permitted {
-            Some(wait_for_tokens(cost, self.leak_rate_per_second))
+        let track_access = if let Some(ttl) = self.idle_ttl {
+            let ttl_nanos = duration_to_nanos_sat(ttl);
+            let emission = self.params.emission_interval_nanos;
+            self.shards.maybe_cleanup(CLEANUP_SAMPLE_MASK, |state| {
+                state.is_evictable(now, ttl_nanos, emission)
+            });
+            true
         } else {
-            None
-        };
-        let current_level = self.capacity.saturating_sub(remaining_capacity);
-        let reset = if self.leak_rate_per_second > 0 && current_level > 0 {
-            Some(wait_for_tokens(current_level, self.leak_rate_per_second))
-        } else {
-            Some(Duration::from_secs(0))
+            false
         };
 
-        RateLimitDecision {
-            permitted,
-            retry_after,
-            remaining: Some(remaining_capacity),
-            limit: self.capacity,
-            reset,
-        }
+        self.shards.with_or_insert(
+            key,
+            || AtomicTatState::new(now),
+            |state| state.try_consume(&self.params, now, cost, track_access),
+        )
     }
 }
 
-impl super::private::Sealed for LeakyBucket {}
+impl<K: RateLimitKey> fmt::Debug for LeakyBucket<K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LeakyBucket")
+            .field("capacity", &self.params.capacity)
+            .field("leak_rate_per_second", &self.leak_rate_per_second)
+            .field(
+                "emission_interval_nanos",
+                &self.params.emission_interval_nanos,
+            )
+            .field("idle_ttl", &self.idle_ttl)
+            .field("tracked_keys", &self.shards.len())
+            .finish()
+    }
+}
 
-impl Algorithm for LeakyBucket {
-    fn check(&self, key: &str) -> RateLimitDecision {
-        self.check_impl(key, 1)
+impl<K: RateLimitKey> super::private::Sealed for LeakyBucket<K> {}
+
+impl<K: RateLimitKey> Algorithm for LeakyBucket<K> {
+    type Key = K;
+
+    #[inline]
+    fn check_with_cost<Q>(&self, key: &Q, cost: u64) -> RateLimitDecision
+    where
+        Self::Key: Borrow<Q>,
+        Q: Hash + Ord + fmt::Debug + ToKey<Self::Key> + ?Sized,
+    {
+        self.check_impl(key, cost)
     }
 
-    fn check_with_cost(&self, key: &str, cost: u64) -> RateLimitDecision {
-        self.check_impl(key, cost)
+    fn peek<Q>(&self, key: &Q) -> RateLimitDecision
+    where
+        Self::Key: Borrow<Q>,
+        Q: Hash + Ord + ?Sized,
+    {
+        let now = self.now_nanos();
+        self.shards
+            .with_existing(key, |state| state.peek(&self.params, now))
+            .unwrap_or_else(|| self.params.untouched_decision())
+    }
+
+    fn reset<Q>(&self, key: &Q) -> bool
+    where
+        Self::Key: Borrow<Q>,
+        Q: Hash + Ord + ?Sized,
+    {
+        self.shards.remove(key)
+    }
+
+    fn clear(&self) {
+        self.shards.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.shards.len()
+    }
+
+    fn cleanup(&self) -> usize {
+        let Some(ttl) = self.idle_ttl else {
+            return 0;
+        };
+        let now = self.now_nanos();
+        let ttl_nanos = duration_to_nanos_sat(ttl);
+        let emission = self.params.emission_interval_nanos;
+        self.shards
+            .cleanup_all(|state| state.is_evictable(now, ttl_nanos, emission))
     }
 }
 
@@ -344,12 +282,9 @@ mod tests {
     async fn test_leaky_bucket_basic() {
         let bucket = LeakyBucket::new(10, 100);
 
-        // First request should succeed (bucket starts empty)
         let decision = bucket.check("test-key");
         assert!(decision.permitted, "First request should be permitted");
 
-        // Multiple rapid requests should eventually be rate limited
-        // since leaky bucket doesn't allow bursts
         let mut permitted_count = 1;
         for _ in 0..20 {
             let decision = bucket.check("test-key");
@@ -358,7 +293,6 @@ mod tests {
             }
         }
 
-        // Should have rate limited some requests (capacity is 10, we sent 21 total)
         assert!(
             permitted_count <= 11,
             "Should have rate limited some requests, but allowed {}",
@@ -368,54 +302,67 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_leaky_bucket_leak_rate() {
-        let bucket = LeakyBucket::new(5, 10); // 5 capacity, 10 per second leak rate
+        let bucket = LeakyBucket::new(5, 10);
 
-        // Fill the bucket to capacity
         for i in 0..5 {
             let decision = bucket.check("test-key");
             assert!(decision.permitted, "Request {} should be permitted", i + 1);
         }
 
-        // Should be rate limited now (bucket full)
         let decision = bucket.check("test-key");
         assert!(!decision.permitted, "Should be rate limited when full");
 
-        // Wait 100ms (should leak 1 token at 10/sec)
         tokio::time::advance(Duration::from_millis(100)).await;
 
-        // Should work again
         let decision = bucket.check("test-key");
         assert!(decision.permitted, "Request should be permitted after leak");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_leaky_bucket_partial_fill_retry_after() {
+        // Capacity 10, leak rate 10/sec (100ms per unit).
+        let bucket = LeakyBucket::new(10, 10);
+
+        // Add 7 units -> 3 remaining capacity.
+        let d = bucket.check_with_cost("k", 7);
+        assert!(d.permitted);
+        assert_eq!(d.remaining, Some(3));
+
+        // Requesting cost 5 needs only 2 units to drain (200ms), NOT 5 units (500ms)!
+        let d = bucket.check_with_cost("k", 5);
+        assert!(!d.permitted);
+        assert_eq!(d.remaining, Some(3));
+        assert_eq!(d.retry_after, Some(Duration::from_millis(200)));
+
+        // Unfulfillable cost > capacity returns retry_after: None.
+        let d_huge = bucket.check_with_cost("k", 11);
+        assert!(!d_huge.permitted);
+        assert_eq!(d_huge.retry_after, None);
     }
 
     #[tokio::test]
     async fn test_leaky_bucket_multiple_keys() {
         let bucket = LeakyBucket::new(2, 10);
 
-        // Key 1: fill bucket
         let _ = bucket.check("key1");
         let _ = bucket.check("key1");
         let decision = bucket.check("key1");
         assert!(!decision.permitted, "key1 should be rate limited");
 
-        // Key 2: should still work (separate bucket)
         let decision = bucket.check("key2");
         assert!(decision.permitted, "key2 should be permitted");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_leaky_bucket_cost() {
         let bucket = LeakyBucket::new(10, 10);
 
-        // Request with cost 5 should work
         let decision = bucket.check_with_cost("test-key", 5);
         assert!(decision.permitted, "Cost 5 request should be permitted");
 
-        // Request with cost 6 should fail (5 + 6 > 10)
         let decision = bucket.check_with_cost("test-key", 6);
         assert!(!decision.permitted, "Cost 6 request should be denied");
 
-        // Request with cost 5 should still work (still at 5)
         let decision = bucket.check_with_cost("test-key", 5);
         assert!(decision.permitted, "Cost 5 request should still work");
     }
@@ -424,24 +371,15 @@ mod tests {
     async fn test_leaky_bucket_ttl() {
         let bucket = LeakyBucket::with_ttl(10, 100, Duration::from_secs(1));
 
-        // Access key1
         let _ = bucket.check("key1");
-        assert_eq!(bucket.buckets.len(), 1);
+        assert_eq!(bucket.len(), 1);
 
-        // Advance time past TTL
         tokio::time::advance(Duration::from_secs(2)).await;
 
-        // Access key2 multiple times to trigger cleanup
-        for _ in 0..200 {
+        for _ in 0..300 {
             let _ = bucket.check("key2");
         }
 
-        // key1 should eventually be evicted
-        let count = bucket.buckets.len();
-        assert!(
-            (1..=2).contains(&count),
-            "Expected 1-2 keys after TTL, got {}",
-            count
-        );
+        assert_eq!(bucket.len(), 1);
     }
 }

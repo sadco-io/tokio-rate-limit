@@ -3,7 +3,8 @@
 use thiserror::Error;
 
 /// Error types that can occur during rate limiting operations.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Configuration error.
     #[error("Configuration error: {0}")]

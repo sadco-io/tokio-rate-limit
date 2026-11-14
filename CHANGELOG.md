@@ -7,11 +7,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-13
+
+Major correctness, performance, and API ergonomics release: spec-compliant gRPC
+wire responses, single-atomic GCRA internals (`AtomicTatState`), generic typed
+keys, sub-1-req/s builders, state management APIs, and zero-allocation Tower
+middleware.
+
+### Breaking
+
+- **gRPC HTTP/2 wire status fix (`tonic-support`):** Denied gRPC requests now
+  return HTTP `200 OK` with `content-type: application/grpc` and
+  `grpc-status: 8` (`Code::ResourceExhausted`) via `tonic::Status::into_http()`,
+  per the gRPC over HTTP/2 wire specification. Previously `GrpcRateLimitLayer`
+  returned HTTP `429 Too Many Requests`, which caused Tonic clients and proxies
+  to synthesize `Code::Unavailable` (14) instead of `Code::ResourceExhausted`
+  (8).
+- **Removed deprecated `CachedTokenBucket`** and deprecated
+  `TokenBucket::with_shard_count` / `TokenBucket::with_ttl_and_shard_count`.
+- **`Algorithm` has an associated `type Key: RateLimitKey`** (defaulting to
+  `String` on `TokenBucket<K = String>`, `LeakyBucket<K = String>`, and
+  `ProbabilisticTokenBucket<K = String>`). Generic bounds `<A: Algorithm>` that
+  call `algorithm.check("...")` with `&str` should specify
+  `<A: Algorithm<Key = String>>`.
+- **`Error` is now `#[non_exhaustive]`** (and derives `Clone, PartialEq, Eq`).
+- **`KeyExtractor` and `GrpcKeyExtractor` use GAT `type Key<'a>`** to support
+  zero-allocation borrowed keys (`&'a str`, stack-formatted `StackIp`, and
+  typed keys `K`) alongside owned keys.
+- **`metrics-support` no longer implies `observability`** (users who want both
+  `metrics` and `tracing` should enable both features explicitly).
+
 ### Fixed
 
-- `cargo test` / `cargo build --examples` with default features compile again.
-  `axum_middleware` and `custom_key_extraction` now declare
-  `required-features = ["middleware"]`, matching the tonic targets.
+- **Contended token-refill race eliminated:** `TokenBucket` and `LeakyBucket`
+  replaced the two-atomic (`tokens` + `last_refill_nanos`) state with a single
+  `AtomicU64` GCRA Theoretical Arrival Time (`AtomicTatState`), making time
+  advancement and quota debit a single atomic CAS with zero lost or out-of-order
+  credits under multi-thread contention.
+- **Unfulfillable `cost > capacity` requests:** `check_with_cost` across all
+  algorithms now returns `retry_after: None` when `cost > capacity` instead of
+  a misleading non-zero wait, and `acquire_with_cost` /
+  `acquire_timeout_with_cost` return immediately instead of looping forever.
+- **TTL eviction quota-reset bypass closed:** Idle TTL eviction no longer evicts
+  a bucket whose quota has not yet fully recovered (`now < tat`), preventing an
+  exhausted client under slow refill rates (`idle_ttl < reset`) from regaining a
+  fresh full burst early; `Duration::MAX` TTLs now saturate cleanly instead of
+  truncating `u128 -> u64`.
+- **Hash-flooding shard-collision resistance:** Replaced unseeded FNV-1a shard
+  routing with per-instance OS-seeded `ahash::RandomState`, routing the top 8
+  bits across 256 shards and reusing the lower bits inside each `flurry` shard.
+- **`LeakyBucket` partial-fill `retry_after`:** Denying a multi-token request
+  against a partially occupied `LeakyBucket` now computes the exact deficit
+  (`cost - available`) rather than charging the full `cost` wait.
+- **Tower `Service::poll_ready` contract:** `RateLimitService` and
+  `GrpcRateLimitService` now swap out the readied inner service via
+  `std::mem::replace(&mut self.inner, clone)` before `call`, preventing panics
+  when composed over stateful Tower layers (`ConcurrencyLimit`, `Buffer`, etc.).
+- **Metrics wiring:** `RateLimiter::check` and `check_with_cost` now emit
+  `tokio_rate_limit.requests.allowed`, `tokio_rate_limit.requests.denied`, and
+  `tokio_rate_limit.remaining_tokens` directly (and HTTP fail-closed missing-key
+  denials increment `requests.denied` without double-counting).
+- **Default-feature examples:** `axum_middleware` and `custom_key_extraction`
+  declare `required-features = ["middleware"]` so `cargo test` with default
+  features compiles cleanly; fixed the `"unknown".parse().unwrap()` panic and
+  weighted `ProcessData` limit in `examples/grpc-hello`.
+- **Dependency advisory (`RUSTSEC-2026-0386`):** Raised minimum `tokio` floor to
+  `1.53.3` (`1.54.1` in `Cargo.lock`) so `cargo deny check` passes cleanly.
+
+### Performance
+
+- **Unboxed middleware futures:** Replaced `Pin<Box<dyn Future + Send>>` on
+  every HTTP and gRPC request with `pin-project-lite` state machines
+  (`RateLimitFuture`, `GrpcRateLimitFuture`).
+- **Zero-allocation hot-path middleware:** Added stack-buffered `StackIp` IPv4 /
+  IPv6 formatting, borrowed `&str` extraction (`HeaderKeyExtractor`,
+  `MethodKeyExtractor`, `MetadataKeyExtractor`, `CustomKeyExtractor::borrowed`),
+  `HeaderName::from_static`, and `HeaderValue::from(u64)` integer headers
+  (including legacy `X-RateLimit-Reset`).
+- **Non-blocking TTL sweeps & 256-shard `LeakyBucket`:** `LeakyBucket` now uses
+  the shared 256-shard `ShardedMap`, and probabilistic TTL cleanup sweeps 16
+  shards round-robin behind a `try_evict` `AtomicBool` guard so an entire
+  256-shard scan never blocks a caller.
+- Trimmed unused `tokio/sync` feature from library dependencies.
+
+### Added
+
+- **Generic key types (`RateLimitKey`, `ToKey<K>`):** Construct typed limiters
+  via `RateLimiter::builder()...build_with_key::<K>()` (e.g. `IpAddr`, `u64`,
+  `Arc<str>`, tuples) and `TokenBucket::new_with_key` / `LeakyBucket::new_with_key`
+  / `ProbabilisticTokenBucket::new_with_key`.
+- **Sub-1-req/s & flexible rate builders:** `RateLimiterBuilder::per_minute(n)`,
+  `per_hour(n)`, `replenish_interval(Duration)`, `idle_ttl(Duration)`, plus
+  `TokenBucket::with_period` / `LeakyBucket::with_period`; lifted the
+  `burst >= requests_per_second` restriction so tight bursts (`burst < rps`) are
+  supported.
+- **State introspection & management:** `peek`, `reset`, `clear`, `len`,
+  `is_empty`, and deterministic `cleanup` on both `Algorithm` and `RateLimiter`.
+- **Async cost acquisition:** `RateLimiter::acquire_with_cost` and
+  `RateLimiter::acquire_timeout_with_cost`.
+- **Middleware combinators & generic HTTP bodies:** `HeaderKeyExtractor`,
+  `.with_cost(...)`, `.on_rejected(...)`, generic `ReqBody` / `RespBody` support
+  on `RateLimitService`, and `IntoRateLimiter` so layers accept either
+  `RateLimiter` (`Clone` + `Debug`) or `Arc<RateLimiter>`.
+- **Optional `serde` feature:** Derives `Serialize` and `Deserialize` on
+  `RateLimiterConfig` and `RateLimitDecision` (plus `Copy, PartialEq, Eq` on
+  `RateLimitDecision` and `PartialEq, Eq, Hash` on `RateLimiterConfig`).
 
 ## [0.10.0] - 2026-08-28
 

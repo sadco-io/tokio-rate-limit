@@ -1,8 +1,6 @@
-//! TokenBucket vs deprecated CachedTokenBucket.
+//! TokenBucket vs ProbabilisticTokenBucket across distributions and concurrency.
 //!
 //! Run with: cargo bench --bench v0_6_optimizations
-
-#![allow(deprecated)]
 
 use criterion::{
     criterion_group, criterion_main, BenchmarkId, Criterion, PlotConfiguration, Throughput,
@@ -12,8 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use tokio::runtime::Runtime;
-#[allow(deprecated)]
-use tokio_rate_limit::algorithm::{CachedTokenBucket, TokenBucket};
+use tokio_rate_limit::algorithm::{ProbabilisticTokenBucket, TokenBucket};
 use tokio_rate_limit::Algorithm;
 
 /// Generate key with specific distribution
@@ -68,9 +65,9 @@ fn single_threaded_comparison(c: &mut Criterion) {
         });
     });
 
-    // Cached
-    group.bench_function("cached_token_bucket", |b| {
-        let bucket = CachedTokenBucket::new(1_000_000, 1_000_000);
+    // Probabilistic (10% sampling)
+    group.bench_function("probabilistic_token_bucket", |b| {
+        let bucket = ProbabilisticTokenBucket::new(1_000_000, 1_000_000, 10);
         b.to_async(&rt).iter(|| async {
             let result = bucket.check(black_box("test-key"));
             black_box(result)
@@ -93,7 +90,7 @@ fn multi_threaded_comparison(c: &mut Criterion) {
             BenchmarkId::new("baseline", format!("{}_threads", num_threads)),
             &num_threads,
             |b, &threads| {
-                let rt = Runtime::new().unwrap();
+                let _rt = Runtime::new().unwrap();
                 let bucket = Arc::new(TokenBucket::new(1_000_000, 1_000_000));
 
                 b.iter_custom(|iters| {
@@ -135,7 +132,7 @@ fn multi_threaded_comparison(c: &mut Criterion) {
             BenchmarkId::new("simd", format!("{}_threads", num_threads)),
             &num_threads,
             |b, &threads| {
-                let rt = Runtime::new().unwrap();
+                let _rt = Runtime::new().unwrap();
                 let bucket = Arc::new(TokenBucket::new(1_000_000, 1_000_000));
 
                 b.iter_custom(|iters| {
@@ -177,7 +174,7 @@ fn multi_threaded_comparison(c: &mut Criterion) {
             BenchmarkId::new("zerocopy", format!("{}_threads", num_threads)),
             &num_threads,
             |b, &threads| {
-                let rt = Runtime::new().unwrap();
+                let _rt = Runtime::new().unwrap();
                 let bucket = Arc::new(TokenBucket::new(1_000_000, 1_000_000));
 
                 b.iter_custom(|iters| {
@@ -214,13 +211,13 @@ fn multi_threaded_comparison(c: &mut Criterion) {
             },
         );
 
-        // Cached
+        // Probabilistic (10% sampling)
         group.bench_with_input(
-            BenchmarkId::new("cached", format!("{}_threads", num_threads)),
+            BenchmarkId::new("probabilistic", format!("{}_threads", num_threads)),
             &num_threads,
             |b, &threads| {
-                let rt = Runtime::new().unwrap();
-                let bucket = Arc::new(CachedTokenBucket::new(1_000_000, 1_000_000));
+                let _rt = Runtime::new().unwrap();
+                let bucket = Arc::new(ProbabilisticTokenBucket::new(1_000_000, 1_000_000, 10));
 
                 b.iter_custom(|iters| {
                     let barrier = Arc::new(std::sync::Barrier::new(threads));
@@ -311,12 +308,12 @@ fn key_cardinality_comparison(c: &mut Criterion) {
             },
         );
 
-        // Cached
+        // Probabilistic
         group.bench_with_input(
-            BenchmarkId::new("cached", format!("{}_keys", cardinality)),
+            BenchmarkId::new("probabilistic", format!("{}_keys", cardinality)),
             &cardinality,
             |b, &card| {
-                let bucket = Arc::new(CachedTokenBucket::new(1_000_000, 1_000_000));
+                let bucket = Arc::new(ProbabilisticTokenBucket::new(1_000_000, 1_000_000, 10));
                 let counter = Arc::clone(&counter);
 
                 b.to_async(&rt).iter(|| {
@@ -361,9 +358,9 @@ fn hot_key_distribution(c: &mut Criterion) {
         });
     });
 
-    // Cached with hot keys (should show improvement)
-    group.bench_function("cached_hot_keys", |b| {
-        let bucket = Arc::new(CachedTokenBucket::new(1_000_000, 1_000_000));
+    // Probabilistic with hot keys
+    group.bench_function("probabilistic_hot_keys", |b| {
+        let bucket = Arc::new(ProbabilisticTokenBucket::new(1_000_000, 1_000_000, 10));
         let counter = Arc::clone(&counter);
 
         b.to_async(&rt).iter(|| {
@@ -423,9 +420,9 @@ fn cold_key_distribution(c: &mut Criterion) {
         });
     });
 
-    // Cached with cold keys (may show regression)
-    group.bench_function("cached_cold_keys", |b| {
-        let bucket = Arc::new(CachedTokenBucket::new(1_000_000, 1_000_000));
+    // Probabilistic with cold keys
+    group.bench_function("probabilistic_cold_keys", |b| {
+        let bucket = Arc::new(ProbabilisticTokenBucket::new(1_000_000, 1_000_000, 10));
         let counter = Arc::clone(&counter);
 
         b.to_async(&rt).iter(|| {

@@ -1,25 +1,25 @@
 //! # tokio-rate-limit
 //!
-//! High-performance rate limiting library with lock-free token accounting and sharded state management.
+//! High-performance rate limiting library with lock-free GCRA token accounting and sharded state management.
 //!
 //! ## Features
 //!
-//! - **Lock-free token accounting**: Atomic CAS on per-key buckets
-//! - **256-shard state management**: Lock-free concurrent hashmap (flurry)
+//! - **Lock-free token accounting**: Single-word atomic CAS on per-key Theoretical Arrival Time (GCRA)
+//! - **256-shard state management**: Seeded `ahash` shard routing over lock-free concurrent hashmaps (`flurry`)
+//! - **Generic & zero-alloc keys**: Rate limit by `String`/`&str`, `IpAddr`, `u64`, tuples, or custom key types
 //! - **Pluggable algorithms**: Token bucket, leaky bucket, probabilistic sampling
-//! - **Axum / Tonic middleware**: Drop-in HTTP and gRPC rate limiting
+//! - **Axum / Tonic middleware**: Drop-in HTTP and gRPC rate limiting with zero-allocation hot paths
 //!
 //! Absolute throughput is hardware-specific; compare against `governor` with
-//! `benches/comparison.rs` on the machine you care about. The hot path still
-//! allocates on first sight of a key (the map insert).
+//! `benches/comparison.rs` on the machine you care about. For string keys, the
+//! hot path only allocates on first sight of a key (the map insert).
 //!
 //! ## Architecture
 //!
-//! This library uses a hybrid approach for maximum performance:
-//! - **Token updates**: True lock-free atomic compare-and-swap operations
-//! - **Key lookup**: 256-shard lock-free concurrent hashmap (flurry) for near-linear multi-threaded scaling
-//!
-//! This design provides excellent concurrency while maintaining per-key isolation.
+//! This library uses a hybrid approach for high throughput and predictable tail latency:
+//! - **Quota updates**: Single-word lock-free atomic compare-and-swap (GCRA Theoretical Arrival Time)
+//! - **Key lookup**: 256-shard lock-free concurrent hashmap (`flurry`) with per-instance seeded hashing
+//! - **Bounded TTL eviction**: Incremental round-robin shard sweeps without full-map latency spikes
 //!
 //! ## Quick Start
 //!
@@ -60,7 +60,9 @@ pub mod middleware;
 pub mod tonic_middleware;
 
 pub use error::{Error, Result};
-pub use limiter::{RateLimitDecision, RateLimiter, RateLimiterBuilder, RateLimiterConfig};
+pub use limiter::{
+    IntoRateLimiter, RateLimitDecision, RateLimiter, RateLimiterBuilder, RateLimiterConfig,
+};
 
-/// Re-export of the rate limiter algorithm trait for custom implementations
-pub use algorithm::Algorithm;
+/// Re-export of the rate limiter algorithm and key traits.
+pub use algorithm::{Algorithm, RateLimitKey, ToKey};
