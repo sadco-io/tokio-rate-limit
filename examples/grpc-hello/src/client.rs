@@ -6,10 +6,10 @@
 //! - Extracting rate limit metadata from responses
 //!
 //! Before running this, start the server:
-//!   cargo run --example grpc_tonic --features tonic-support
+//!   cargo run -p grpc-hello --bin grpc-hello
 //!
 //! Then run this client:
-//!   cargo run --example grpc_tonic_client --features tonic-support
+//!   cargo run -p grpc-hello --bin grpc-hello-client
 
 use std::time::Duration;
 use tokio::time::sleep;
@@ -79,11 +79,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
 
                 // If we get retry-after, wait that long
-                if let Some(seconds) = retry_after {
-                    if seconds > 0 && seconds < 5 {
-                        println!("    Waiting {}s before continuing...", seconds);
-                        sleep(Duration::from_secs(seconds)).await;
-                    }
+                if let Some(seconds) = retry_after.filter(|s| (1..5).contains(s)) {
+                    println!("    Waiting {}s before continuing...", seconds);
+                    sleep(Duration::from_secs(seconds)).await;
                 }
             }
         }

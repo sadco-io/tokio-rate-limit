@@ -8,7 +8,7 @@ use tokio_rate_limit::algorithm::{ProbabilisticTokenBucket, TokenBucket};
 use tokio_rate_limit::Algorithm;
 
 /// Test helper to measure actual throughput
-async fn measure_throughput<A: Algorithm>(
+async fn measure_throughput<A: Algorithm<Key = String>>(
     algorithm: &A,
     key: &str,
     duration: Duration,

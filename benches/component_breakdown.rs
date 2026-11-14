@@ -70,18 +70,18 @@ fn fnv_hash(key: &str) -> u64 {
     hash
 }
 
-fn full_check<A: Algorithm>(name: &str, algorithm: &A, iters: u64) -> f64 {
+fn full_check<A: Algorithm<Key = String>>(name: &str, algorithm: &A, iters: u64) -> f64 {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     let elapsed = runtime.block_on(async {
         for _ in 0..iters / 10 {
-            black_box(algorithm.check(black_box("hot-key")));
+            let _ = black_box(algorithm.check(black_box("hot-key")));
         }
         let start = Instant::now();
         for _ in 0..iters {
-            black_box(algorithm.check(black_box("hot-key")));
+            let _ = black_box(algorithm.check(black_box("hot-key")));
         }
         start.elapsed()
     });
@@ -92,7 +92,7 @@ fn full_check<A: Algorithm>(name: &str, algorithm: &A, iters: u64) -> f64 {
 
 fn full_check_contended<A>(name: &str, algorithm: Arc<A>, threads: usize, iters: u64)
 where
-    A: Algorithm + Send + Sync + 'static,
+    A: Algorithm<Key = String> + Send + Sync + 'static,
 {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads)
@@ -106,7 +106,7 @@ where
             let algorithm = Arc::clone(&algorithm);
             handles.push(tokio::spawn(async move {
                 for _ in 0..iters {
-                    black_box(algorithm.check(black_box("hot-key")));
+                    let _ = black_box(algorithm.check(black_box("hot-key")));
                 }
             }));
         }
@@ -139,15 +139,13 @@ fn main() {
     });
 
     use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hash, Hasher};
+    use std::hash::BuildHasher;
     let random_state = RandomState::new();
     time(
         "siphash (default map hasher, 7-byte key)",
         10_000_000,
         || {
-            let mut hasher = random_state.build_hasher();
-            black_box("hot-key").hash(&mut hasher);
-            black_box(hasher.finish());
+            black_box(random_state.hash_one(black_box("hot-key")));
         },
     );
 

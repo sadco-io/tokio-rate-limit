@@ -26,7 +26,7 @@ use axum::{
 };
 use std::sync::Arc;
 use tokio_rate_limit::{
-    middleware::{CustomKeyExtractor, RateLimitLayer},
+    middleware::{CustomKeyExtractor, HeaderKeyExtractor, RateLimitLayer},
     RateLimiter,
 };
 
@@ -66,18 +66,12 @@ async fn main() {
             }),
         ));
 
-    // Router with API key-based rate limiting
+    // Router with zero-allocation API key header rate limiting
     let api_routes = Router::new()
         .route("/api/secure", get(secure_handler))
         .layer(RateLimitLayer::with_extractor(
             api_key_limiter,
-            CustomKeyExtractor::new(|req: &Request<Body>| {
-                // Extract API key from header
-                req.headers()
-                    .get("X-API-Key")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| format!("apikey:{}", s))
-            }),
+            HeaderKeyExtractor::from_static("x-api-key"),
         ));
 
     // Combine routes

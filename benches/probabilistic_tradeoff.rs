@@ -53,7 +53,11 @@ const KEYS: usize = 10;
 
 /// Drives one algorithm at a fixed offered rate over a virtual window,
 /// spreading the requests over `keys` keys round-robin.
-async fn drive<A: Algorithm>(algorithm: &A, offered_per_sec: u64, keys: usize) -> (u64, u64) {
+async fn drive<A: Algorithm<Key = String>>(
+    algorithm: &A,
+    offered_per_sec: u64,
+    keys: usize,
+) -> (u64, u64) {
     let offered = offered_per_sec * WINDOW_SECS;
     let interval = Duration::from_nanos(1_000_000_000 / offered_per_sec);
     let key_names: Vec<String> = (0..keys).map(|i| format!("key-{i}")).collect();
@@ -218,7 +222,7 @@ fn paused_runtime() -> tokio::runtime::Runtime {
 }
 
 /// Replay `sequence` against a fresh algorithm on a fresh paused clock.
-fn zipf_pass<A: Algorithm>(
+fn zipf_pass<A: Algorithm<Key = String>>(
     make: impl FnOnce() -> A,
     keys: &[String],
     sequence: &[u32],
@@ -530,7 +534,7 @@ fn deny_path(c: &mut Criterion) {
 /// single shared key, and returns the wall-clock time for all of them.
 fn contended_run<A>(algorithm: Arc<A>, threads: usize, iterations: u64) -> Duration
 where
-    A: Algorithm + Send + Sync + 'static,
+    A: Algorithm<Key = String> + Send + Sync + 'static,
 {
     let runtime = Builder::new_multi_thread()
         .worker_threads(threads)

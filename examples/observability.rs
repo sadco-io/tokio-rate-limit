@@ -95,5 +95,4 @@ async fn main() {
     println!("• tokio_rate_limit.requests.allowed - Counter");
     println!("• tokio_rate_limit.requests.denied - Counter");
     println!("• tokio_rate_limit.remaining_tokens - Histogram");
-    println!("\nSee OBSERVABILITY.md for complete integration examples!");
 }

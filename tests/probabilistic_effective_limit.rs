@@ -78,7 +78,7 @@ async fn burst_is_capped_at_capacity_for_every_sample_rate() {
 /// Returns `(allowed, offered)`. The clock is advanced explicitly, so the
 /// result is a function of the algorithm alone -- not of how fast the machine
 /// running the test happens to be.
-async fn drive<A: Algorithm>(
+async fn drive<A: Algorithm<Key = String>>(
     algorithm: &A,
     key: &str,
     offered_per_sec: u64,
