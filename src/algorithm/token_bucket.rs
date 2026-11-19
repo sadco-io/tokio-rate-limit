@@ -500,11 +500,21 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(2)).await;
 
-        for _ in 0..300 {
+        // Idle-key cleanup is sampled (about 1 in 16 checks) and each run sweeps 16 of the
+        // 256 shards, so reaching key1's shard can take up to 16 runs (~256 checks). Loop until
+        // it is swept; the bound only guards against a regression that stops eviction.
+        let _ = bucket.check("key2");
+        let mut checks = 1;
+        while bucket.len() > 1 && checks < 20_000 {
             let _ = bucket.check("key2");
+            checks += 1;
         }
 
-        assert_eq!(bucket.len(), 1, "expired key1 should have been swept");
+        assert_eq!(
+            bucket.len(),
+            1,
+            "expired key1 should have been swept within {checks} checks"
+        );
     }
 
     #[tokio::test(start_paused = true)]
