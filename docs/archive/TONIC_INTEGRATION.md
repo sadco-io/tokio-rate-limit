@@ -112,7 +112,9 @@ let layer = GrpcRateLimitLayer::with_extractor(
     IpKeyExtractor
 );
 
-// Extracts IP from x-forwarded-for or x-real-ip headers
+// Reads the connection peer IP from a bare SocketAddr extension or Tonic's TcpConnectInfo.
+// Deployments behind a trusted reverse proxy should use ForwardedIpKeyExtractor::x_forwarded_for()
+// or ForwardedIpKeyExtractor::x_real_ip().
 ```
 
 ### 3. Custom Metadata Extraction

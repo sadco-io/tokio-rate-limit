@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-11-19
+
+### Security
+
+- The gRPC `IpKeyExtractor` now keys on the connection's peer address and no longer reads `x-forwarded-for` or `x-real-ip`. Deployments behind a trusted proxy should switch to the new `ForwardedIpKeyExtractor`. See GHSA-r5c9-r265-ccg3.
+
+### Added
+
+- **`ForwardedIpKeyExtractor` (`tonic-support`):** Opt-in gRPC key extractor for deployments behind a trusted reverse proxy, with explicit single-header constructors: `ForwardedIpKeyExtractor::x_forwarded_for()` (also `new()` and `Default`, reading only `x-forwarded-for`) and `ForwardedIpKeyExtractor::x_real_ip()` (reading only `x-real-ip`), with no cascade between headers. Reads the last comma-separated element of the last header field directly from raw bytes (so invalid bytes earlier in the line cannot affect the proxy's hop), trims ASCII whitespace, and parses `ip`, `ip:port`, `[v6]`, and `[v6]:port` into an `IpAddr`. Returns `None` (failing closed unless `.fail_open()` is enabled) when the configured header is present but unusable, and falls back to the connection's peer address when the header is absent. Both `GrpcKeyExtractor<String>` (stack-formatted via `StackIp::from_ip`) and `GrpcKeyExtractor<IpAddr>` key on the same parsed `IpAddr`. Use only behind a trusted proxy directly in front of the server that overwrites `x-forwarded-for` or appends the client IP as the final element of the final field (for `x_forwarded_for()`), or overwrites `x-real-ip` on every request (for `x_real_ip()`).
+
+### Changed
+
+- **`IpKeyExtractor` (`tonic-support`):** Reads the peer IP from a bare `SocketAddr` request extension first (preserving explicit server-side overrides such as PROXY protocol layers), then falls back to `tonic::transport::server::TcpConnectInfo::remote_addr()` (supporting both plaintext TCP and Tonic's built-in `Server::tls_config` TLS), and no longer reads `x-forwarded-for` or `x-real-ip`.
+
+### Upgrading to 0.11.1
+
+Without a server-supplied address override, deployments behind a reverse proxy that remain on `IpKeyExtractor` without switching to `ForwardedIpKeyExtractor` will key every request on the proxy's peer IP address, causing all clients behind that proxy to share a single rate-limit bucket. Compared to the 0.10–0.11.0 `IpKeyExtractor` header behavior, `ForwardedIpKeyExtractor` reads the last comma-separated element of the last `x-forwarded-for` field (whereas 0.10–0.11.0 read the last element of the first field), reads only its single configured header (`x_forwarded_for()` or `x_real_ip()`) rather than cascading across headers, falls back to the peer address when the configured header is absent, and returns no key when the final element is unusable. The limiter rejects that request by default and passes it through without limiting if `.fail_open()` is enabled. Direct TCP and Tonic `Server::tls_config` clients without forwarding headers now resolve to their peer address instead of being rejected, so any `.fail_open()` added solely as a workaround for headerless clients can be removed (note that non-TCP transports without `TcpConnectInfo`, such as Unix sockets or custom TLS incoming streams, still have no peer address unless an outer layer inserts `SocketAddr`). In multi-proxy chains, configure the nearest proxy directly in front of the gRPC server so that the final element of the configured header is the real client IP.
+
 ## [0.11.0] - 2026-11-13
 
 Major correctness, performance, and API ergonomics release: spec-compliant gRPC

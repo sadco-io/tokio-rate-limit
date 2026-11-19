@@ -440,9 +440,22 @@ GrpcRateLimitLayer::with_extractor(
     MetadataKeyExtractor::new("user-id")
 )
 
-// Per-IP - rate limit by client IP address
+// Per-IP (peer address) - checks a bare SocketAddr extension first (e.g. PROXY protocol),
+// then falls back to tonic's TcpConnectInfo::remote_addr(). Never reads forwarding headers.
+// Works with plaintext TCP and tonic's built-in Server::tls_config.
 use tokio_rate_limit::tonic_middleware::IpKeyExtractor;
 GrpcRateLimitLayer::with_extractor(limiter, IpKeyExtractor)
+
+// Per-IP behind a trusted reverse proxy - choose the single header managed by your nearest
+// proxy (no cascade between headers):
+// - x_forwarded_for() (also new() / Default): reads ONLY x-forwarded-for (last element of
+//   the last field); proxy must overwrite x-forwarded-for or append the client IP last.
+// - x_real_ip(): reads ONLY x-real-ip (last field); proxy must overwrite x-real-ip on every
+//   request.
+// In multi-proxy chains, configure the nearest proxy so the final element is the real client.
+use tokio_rate_limit::tonic_middleware::ForwardedIpKeyExtractor;
+GrpcRateLimitLayer::with_extractor(limiter, ForwardedIpKeyExtractor::x_forwarded_for())
+GrpcRateLimitLayer::with_extractor(limiter, ForwardedIpKeyExtractor::x_real_ip())
 
 // Custom - implement your own logic
 use tokio_rate_limit::tonic_middleware::CustomGrpcKeyExtractor;
@@ -453,6 +466,11 @@ GrpcRateLimitLayer::with_extractor(
     })
 )
 ```
+
+> **Notes on gRPC IP extraction:**
+> - **Proxy contract:** Use `ForwardedIpKeyExtractor` only when the gRPC server is not directly reachable by clients and every request passes through a trusted proxy directly in front of it (`x_forwarded_for()` requires overwriting `x-forwarded-for` or appending the client IP as the final element of the final field; `x_real_ip()` requires overwriting `x-real-ip` on every request; in multi-proxy chains, configure the nearest proxy so the final element is the real client). The value the proxy writes must be a bare IP address, or `v4:port` / `[v6]:port` when a port is included (an unbracketed IPv6 address with a port is ambiguous); IPv6 zone IDs are not supported. Absent headers fall back to the peer address; present but malformed headers return `None` (fail-closed unless `.fail_open()` is set).
+> - **IPv6 addresses:** Both `IpKeyExtractor` and `ForwardedIpKeyExtractor` key on the full IP address, so clients assigned an IPv6 `/64` (or larger) subnet can rotate addresses across buckets. Use network-level controls or a `CustomGrpcKeyExtractor` that masks IPv6 prefixes (e.g. `/64` or `/56`).
+> - **`fail_open()` and non-TCP transports:** Transports without `TcpConnectInfo` (such as Unix domain sockets or custom `serve_with_incoming` TLS streams that do not attach `TcpConnectInfo` or a bare `SocketAddr` extension) have no peer address, so `IpKeyExtractor` combined with `.fail_open()` applies no limit.
 
 **Features:**
 - Minimal overhead with unboxed response futures and zero-allocation key extraction
@@ -683,7 +701,7 @@ Deterministic `TokenBucket` and `LeakyBucket` represent each key's entire quota 
 ## Feature Flags
 
 - `middleware` - Enables Axum/Tower HTTP middleware (`RateLimitLayer`, `HeaderKeyExtractor`, `IpKeyExtractor`, `CustomKeyExtractor`)
-- `tonic-support` - Enables Tonic gRPC middleware (`GrpcRateLimitLayer`, `MethodKeyExtractor`, `MetadataKeyExtractor`, `IpKeyExtractor`) *(requires Rust 1.88+)*
+- `tonic-support` - Enables Tonic gRPC middleware (`GrpcRateLimitLayer`, `MethodKeyExtractor`, `MetadataKeyExtractor`, `IpKeyExtractor`, `ForwardedIpKeyExtractor`) *(requires Rust 1.88+)*
 - `observability` - Enables `tracing` instrumentation on limiter checks
 - `metrics-support` - Enables `metrics` counters and histograms on `RateLimiter` and middleware (independent of `observability`)
 - `serde` - Derives `Serialize` and `Deserialize` on `RateLimiterConfig` and `RateLimitDecision`
@@ -691,6 +709,11 @@ Deterministic `TokenBucket` and `LeakyBucket` represent each key's entire quota 
 ## API Documentation
 
 Full API documentation is available at [docs.rs/tokio-rate-limit](https://docs.rs/tokio-rate-limit).
+
+## What's New in v0.11.1
+
+- **gRPC `IpKeyExtractor` uses the connection peer address**: `tonic_middleware::IpKeyExtractor` now reads the peer IP from a bare `SocketAddr` extension first (supporting PROXY protocol / custom server layers) and then `tonic::transport::server::TcpConnectInfo::remote_addr()` (working with both plaintext TCP and Tonic's built-in `Server::tls_config`), and no longer reads `x-forwarded-for` or `x-real-ip`.
+- **Opt-in `ForwardedIpKeyExtractor` for reverse proxies**: Added `tonic_middleware::ForwardedIpKeyExtractor::x_forwarded_for()` (default / `new()`) and `ForwardedIpKeyExtractor::x_real_ip()` for deployments behind a trusted reverse proxy. Reads only its single configured header (last element of the last field, parsed strictly to `IpAddr` with `ip`, `ip:port`, `[v6]`, and `[v6]:port` support), falls back to the peer address when absent, and fails closed when present but invalid.
 
 ## What's New in v0.11.0
 

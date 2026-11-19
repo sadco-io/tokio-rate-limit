@@ -1,0 +1,1 @@
+Test-only TLS fixtures for `tests/tonic_integration.rs`. These are a self-signed test CA (`ca.pem`) and a leaf certificate for `localhost` / `127.0.0.1` / `::1`, valid for 100 years. The CA private key was discarded after signing. Never use them outside tests.

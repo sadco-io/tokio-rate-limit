@@ -9,6 +9,7 @@
 use bytes::{Buf, BufMut, Bytes};
 use std::convert::Infallible;
 use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -16,12 +17,15 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::time::sleep;
 use tokio_rate_limit::tonic_middleware::{
-    CustomGrpcKeyExtractor, GrpcRateLimitLayer, IpKeyExtractor, MetadataKeyExtractor,
+    CustomGrpcKeyExtractor, ForwardedIpKeyExtractor, GrpcKeyExtractor, GrpcLookupKey,
+    GrpcRateLimitLayer, IpKeyExtractor, MetadataKeyExtractor,
 };
 use tokio_rate_limit::RateLimiter;
 use tonic::body::Body;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+use tonic::metadata::MetadataValue;
 use tonic::server::NamedService;
+use tonic::transport::server::TcpConnectInfo;
 use tonic::{Code, Request, Response, Status};
 use tower::limit::ConcurrencyLimitLayer;
 use tower::{Layer, Service, ServiceExt};
@@ -194,7 +198,7 @@ async fn test_per_method_rate_limiting() {
 #[tokio::test]
 async fn test_ip_based_rate_limiting() {
     let limiter = RateLimiter::builder()
-        .requests_per_second(1)
+        .per_minute(1)
         .burst(1)
         .build()
         .unwrap();
@@ -202,26 +206,209 @@ async fn test_ip_based_rate_limiting() {
     let layer = GrpcRateLimitLayer::with_extractor(limiter, IpKeyExtractor);
     let mut service = layer.layer(TestService);
 
-    let request = http::Request::builder()
+    let peer1: SocketAddr = "192.168.1.1:40001".parse().unwrap();
+    let peer2: SocketAddr = "192.168.1.2:40002".parse().unwrap();
+
+    // First request from peer1 via TcpConnectInfo succeeds.
+    let mut request = http::Request::builder()
         .uri("http://localhost/test.Service/Method")
-        .header("x-forwarded-for", "192.168.1.1")
+        .header("x-forwarded-for", "203.0.113.1")
         .body(Body::default())
         .unwrap();
+    request.extensions_mut().insert(TcpConnectInfo {
+        local_addr: None,
+        remote_addr: Some(peer1),
+    });
     assert_grpc_ok(&service.ready().await.unwrap().call(request).await.unwrap());
 
+    // Second request from peer1 with a different x-forwarded-for header still shares peer1's key.
+    let mut request = http::Request::builder()
+        .uri("http://localhost/test.Service/Method")
+        .header("x-forwarded-for", "203.0.113.2")
+        .body(Body::default())
+        .unwrap();
+    request.extensions_mut().insert(TcpConnectInfo {
+        local_addr: None,
+        remote_addr: Some(peer1),
+    });
+    assert_grpc_rate_limited(&service.ready().await.unwrap().call(request).await.unwrap());
+
+    // Request from peer2 via bare SocketAddr extension uses peer2's independent quota.
+    let mut request = http::Request::builder()
+        .uri("http://localhost/test.Service/Method")
+        .body(Body::default())
+        .unwrap();
+    request.extensions_mut().insert(peer2);
+    assert_grpc_ok(&service.ready().await.unwrap().call(request).await.unwrap());
+
+    // Request with only forwarding headers and no connection info fails closed.
     let request = http::Request::builder()
         .uri("http://localhost/test.Service/Method")
-        .header("x-forwarded-for", "192.168.1.1")
+        .header("x-forwarded-for", "203.0.113.3")
         .body(Body::default())
         .unwrap();
     assert_grpc_rate_limited(&service.ready().await.unwrap().call(request).await.unwrap());
+}
 
-    let request = http::Request::builder()
+#[tokio::test]
+async fn test_forwarded_ip_based_rate_limiting() {
+    let limiter = RateLimiter::builder()
+        .per_minute(1)
+        .burst(1)
+        .build()
+        .unwrap();
+
+    let layer =
+        GrpcRateLimitLayer::with_extractor(limiter, ForwardedIpKeyExtractor::x_forwarded_for());
+    let mut service = layer.layer(TestService);
+
+    let proxy_peer: SocketAddr = "10.0.0.10:50000".parse().unwrap();
+
+    let mut request = http::Request::builder()
+        .uri("http://localhost/test.Service/Method")
+        .header("x-forwarded-for", "198.51.100.1, 192.168.1.1")
+        .body(Body::default())
+        .unwrap();
+    request.extensions_mut().insert(TcpConnectInfo {
+        local_addr: None,
+        remote_addr: Some(proxy_peer),
+    });
+    assert_grpc_ok(&service.ready().await.unwrap().call(request).await.unwrap());
+
+    // Same last hop (192.168.1.1) is rate limited even if earlier hops differ.
+    let mut request = http::Request::builder()
+        .uri("http://localhost/test.Service/Method")
+        .header("x-forwarded-for", "198.51.100.99, 192.168.1.1")
+        .body(Body::default())
+        .unwrap();
+    request.extensions_mut().insert(TcpConnectInfo {
+        local_addr: None,
+        remote_addr: Some(proxy_peer),
+    });
+    assert_grpc_rate_limited(&service.ready().await.unwrap().call(request).await.unwrap());
+
+    // Different last hop gets its own quota.
+    let mut request = http::Request::builder()
         .uri("http://localhost/test.Service/Method")
         .header("x-forwarded-for", "192.168.1.2")
         .body(Body::default())
         .unwrap();
+    request.extensions_mut().insert(TcpConnectInfo {
+        local_addr: None,
+        remote_addr: Some(proxy_peer),
+    });
     assert_grpc_ok(&service.ready().await.unwrap().call(request).await.unwrap());
+
+    // Present but invalid x-forwarded-for fails closed even if x-real-ip and peer are present.
+    let mut request = http::Request::builder()
+        .uri("http://localhost/test.Service/Method")
+        .header("x-forwarded-for", "198.51.100.1, ")
+        .header("x-real-ip", "192.168.1.3")
+        .body(Body::default())
+        .unwrap();
+    request.extensions_mut().insert(TcpConnectInfo {
+        local_addr: None,
+        remote_addr: Some(proxy_peer),
+    });
+    assert_grpc_rate_limited(&service.ready().await.unwrap().call(request).await.unwrap());
+
+    // Without x-forwarded-for, falls back to the peer address from TcpConnectInfo
+    // (ignoring x-real-ip).
+    let mut request = http::Request::builder()
+        .uri("http://localhost/test.Service/Method")
+        .header("x-real-ip", "192.168.1.4")
+        .body(Body::default())
+        .unwrap();
+    request.extensions_mut().insert(TcpConnectInfo {
+        local_addr: None,
+        remote_addr: Some(proxy_peer),
+    });
+    assert_grpc_ok(&service.ready().await.unwrap().call(request).await.unwrap());
+
+    let mut request = http::Request::builder()
+        .uri("http://localhost/test.Service/Method")
+        .header("x-real-ip", "192.168.1.5")
+        .body(Body::default())
+        .unwrap();
+    request.extensions_mut().insert(TcpConnectInfo {
+        local_addr: None,
+        remote_addr: Some(proxy_peer),
+    });
+    assert_grpc_rate_limited(&service.ready().await.unwrap().call(request).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_forwarded_x_real_ip_based_rate_limiting() {
+    let limiter = RateLimiter::builder()
+        .per_minute(1)
+        .burst(1)
+        .build()
+        .unwrap();
+
+    let layer = GrpcRateLimitLayer::with_extractor(limiter, ForwardedIpKeyExtractor::x_real_ip());
+    let mut service = layer.layer(TestService);
+    let proxy_peer: SocketAddr = "10.0.0.10:50000".parse().unwrap();
+
+    // Reads x-real-ip and ignores x-forwarded-for.
+    let mut request = http::Request::builder()
+        .uri("http://localhost/test.Service/Method")
+        .header("x-forwarded-for", "203.0.113.1")
+        .header("x-real-ip", "192.0.2.1")
+        .body(Body::default())
+        .unwrap();
+    request.extensions_mut().insert(TcpConnectInfo {
+        local_addr: None,
+        remote_addr: Some(proxy_peer),
+    });
+    assert_grpc_ok(&service.ready().await.unwrap().call(request).await.unwrap());
+
+    // Different x-forwarded-for with the same x-real-ip shares the same bucket.
+    let mut request = http::Request::builder()
+        .uri("http://localhost/test.Service/Method")
+        .header("x-forwarded-for", "203.0.113.2")
+        .header("x-real-ip", "192.0.2.1")
+        .body(Body::default())
+        .unwrap();
+    request.extensions_mut().insert(TcpConnectInfo {
+        local_addr: None,
+        remote_addr: Some(proxy_peer),
+    });
+    assert_grpc_rate_limited(&service.ready().await.unwrap().call(request).await.unwrap());
+
+    // Invalid x-real-ip fails closed even when x-forwarded-for is valid.
+    let mut request = http::Request::builder()
+        .uri("http://localhost/test.Service/Method")
+        .header("x-forwarded-for", "203.0.113.3")
+        .header("x-real-ip", "unknown")
+        .body(Body::default())
+        .unwrap();
+    request.extensions_mut().insert(TcpConnectInfo {
+        local_addr: None,
+        remote_addr: Some(proxy_peer),
+    });
+    assert_grpc_rate_limited(&service.ready().await.unwrap().call(request).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_ip_key_extractor_fail_open_with_no_extensions_and_xff() {
+    let limiter = RateLimiter::builder()
+        .per_minute(1)
+        .burst(1)
+        .build()
+        .unwrap();
+
+    let layer = GrpcRateLimitLayer::with_extractor(limiter, IpKeyExtractor).fail_open();
+    let mut service = layer.layer(TestService);
+
+    for _ in 0..5 {
+        let request = http::Request::builder()
+            .uri("http://localhost/test.Service/Method")
+            .header("x-forwarded-for", "203.0.113.1")
+            .header("x-real-ip", "203.0.113.1")
+            .body(Body::default())
+            .unwrap();
+        assert_grpc_ok(&service.ready().await.unwrap().call(request).await.unwrap());
+    }
 }
 
 #[tokio::test]
@@ -751,6 +938,240 @@ async fn test_real_tonic_client_receives_resource_exhausted_over_http2() {
         Some("2")
     );
 
+    let _ = shutdown_tx.send(());
+    server_task.await.unwrap();
+}
+
+async fn run_real_server_ip_scenario<K, E>(
+    limiter: RateLimiter<tokio_rate_limit::algorithm::TokenBucket<K>>,
+    extractor: E,
+    total_requests: usize,
+    xff_for_index: impl Fn(usize) -> Option<String>,
+) -> (usize, Vec<Code>)
+where
+    K: tokio_rate_limit::RateLimitKey,
+    E: GrpcKeyExtractor<K> + Clone,
+    for<'a> K: std::borrow::Borrow<<E::Key<'a> as GrpcLookupKey<K>>::Query>,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server_task = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .layer(GrpcRateLimitLayer::with_extractor(limiter, extractor))
+            .add_service(RawEchoGrpcService)
+            .serve_with_incoming_shutdown(ListenerStream(listener), async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    let mut client = tonic::client::Grpc::new(channel);
+    let path = http::uri::PathAndQuery::from_static("/test.Echo/Ping");
+    let mut permitted = 0usize;
+    let mut rejected_codes = Vec::new();
+
+    for i in 0..total_requests {
+        let mut req = Request::new(Bytes::from_static(b"ping"));
+        if let Some(xff) = xff_for_index(i) {
+            req.metadata_mut().insert(
+                "x-forwarded-for",
+                MetadataValue::try_from(xff.as_str()).unwrap(),
+            );
+        }
+        client.ready().await.unwrap();
+        match client.unary(req, path.clone(), RawBytesCodec).await {
+            Ok(_) => permitted += 1,
+            Err(status) => rejected_codes.push(status.code()),
+        }
+    }
+
+    drop(client);
+    let _ = shutdown_tx.send(());
+    server_task.await.unwrap();
+    (permitted, rejected_codes)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_real_tonic_server_peer_address_and_forwarded_extractors() {
+    let total = 10usize;
+
+    // (a) IpKeyExtractor with rotating x-forwarded-for from a single TCP client:
+    //     keys on the connection peer address (127.0.0.1), so exactly burst (3) are permitted.
+    let limiter = RateLimiter::builder()
+        .per_minute(1)
+        .burst(3)
+        .build()
+        .unwrap();
+    let (ok_rot, codes_rot) = run_real_server_ip_scenario(limiter, IpKeyExtractor, total, |i| {
+        Some(format!("203.0.113.{}", i + 1))
+    })
+    .await;
+    assert_eq!(ok_rot, 3);
+    assert_eq!(codes_rot.len(), total - 3);
+    assert!(codes_rot.iter().all(|&c| c == Code::ResourceExhausted));
+
+    // (b) IpKeyExtractor with no forwarding headers:
+    //     keys on the connection peer address, so exactly burst (3) are permitted.
+    let limiter = RateLimiter::builder()
+        .per_minute(1)
+        .burst(3)
+        .build()
+        .unwrap();
+    let (ok_none, codes_none) =
+        run_real_server_ip_scenario(limiter, IpKeyExtractor, total, |_| None).await;
+    assert_eq!(ok_none, 3);
+    assert_eq!(codes_none.len(), total - 3);
+    assert!(codes_none.iter().all(|&c| c == Code::ResourceExhausted));
+
+    // (b2) IpKeyExtractor with a typed IpAddr limiter over a real Tonic server.
+    let limiter = RateLimiter::builder()
+        .per_minute(1)
+        .burst(3)
+        .build_with_key::<IpAddr>()
+        .unwrap();
+    let (ok_typed, codes_typed) =
+        run_real_server_ip_scenario(limiter, IpKeyExtractor, total, |i| {
+            Some(format!("203.0.113.{}", i + 1))
+        })
+        .await;
+    assert_eq!(ok_typed, 3);
+    assert_eq!(codes_typed.len(), total - 3);
+    assert!(codes_typed.iter().all(|&c| c == Code::ResourceExhausted));
+
+    // (c) ForwardedIpKeyExtractor::x_forwarded_for() with rotating x-forwarded-for:
+    //     keys on the last x-forwarded-for hop, so all distinct client IPs are permitted.
+    let limiter = RateLimiter::builder()
+        .per_minute(1)
+        .burst(3)
+        .build()
+        .unwrap();
+    let (ok_fwd_rot, codes_fwd_rot) = run_real_server_ip_scenario(
+        limiter,
+        ForwardedIpKeyExtractor::x_forwarded_for(),
+        total,
+        |i| Some(format!("203.0.113.{}", i + 1)),
+    )
+    .await;
+    assert_eq!(ok_fwd_rot, total);
+    assert!(codes_fwd_rot.is_empty());
+
+    // (d) ForwardedIpKeyExtractor::x_forwarded_for() with no forwarding headers:
+    //     falls back to the connection peer address, so exactly burst (3) are permitted.
+    let limiter = RateLimiter::builder()
+        .per_minute(1)
+        .burst(3)
+        .build()
+        .unwrap();
+    let (ok_fwd_none, codes_fwd_none) = run_real_server_ip_scenario(
+        limiter,
+        ForwardedIpKeyExtractor::x_forwarded_for(),
+        total,
+        |_| None,
+    )
+    .await;
+    assert_eq!(ok_fwd_none, 3);
+    assert_eq!(codes_fwd_none.len(), total - 3);
+    assert!(codes_fwd_none.iter().all(|&c| c == Code::ResourceExhausted));
+
+    // (e) ForwardedIpKeyExtractor::x_real_ip() ignores x-forwarded-for and falls back
+    //     to the connection peer address when x-real-ip is absent.
+    let limiter = RateLimiter::builder()
+        .per_minute(1)
+        .burst(3)
+        .build()
+        .unwrap();
+    let (ok_real_fallback, codes_real_fallback) =
+        run_real_server_ip_scenario(limiter, ForwardedIpKeyExtractor::x_real_ip(), total, |i| {
+            Some(format!("203.0.113.{}", i + 1))
+        })
+        .await;
+    assert_eq!(ok_real_fallback, 3);
+    assert_eq!(codes_real_fallback.len(), total - 3);
+    assert!(codes_real_fallback
+        .iter()
+        .all(|&c| c == Code::ResourceExhausted));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_real_tonic_tls_server_ip_key_extractor() {
+    use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
+
+    let limiter = RateLimiter::builder()
+        .per_minute(1)
+        .burst(3)
+        .build()
+        .unwrap();
+
+    let server_identity = Identity::from_pem(
+        include_bytes!("fixtures/tls/server.pem"),
+        include_bytes!("fixtures/tls/server.key"),
+    );
+    let server_tls = ServerTlsConfig::new().identity(server_identity);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server_task = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .tls_config(server_tls)
+            .unwrap()
+            .layer(GrpcRateLimitLayer::with_extractor(limiter, IpKeyExtractor))
+            .add_service(RawEchoGrpcService)
+            .serve_with_incoming_shutdown(ListenerStream(listener), async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let ca = Certificate::from_pem(include_bytes!("fixtures/tls/ca.pem"));
+    let client_tls = ClientTlsConfig::new()
+        .ca_certificate(ca)
+        .domain_name("localhost");
+
+    let channel =
+        tonic::transport::Endpoint::from_shared(format!("https://localhost:{}", addr.port()))
+            .unwrap()
+            .tls_config(client_tls)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+
+    let mut client = tonic::client::Grpc::new(channel);
+    let path = http::uri::PathAndQuery::from_static("/test.Echo/Ping");
+    let total = 10usize;
+    let mut permitted = 0usize;
+    let mut rejected_codes = Vec::new();
+
+    for i in 0..total {
+        let mut req = Request::new(Bytes::from_static(b"ping"));
+        req.metadata_mut().insert(
+            "x-forwarded-for",
+            MetadataValue::try_from(format!("203.0.113.{}", i + 1).as_str()).unwrap(),
+        );
+        client.ready().await.unwrap();
+        match client.unary(req, path.clone(), RawBytesCodec).await {
+            Ok(_) => permitted += 1,
+            Err(status) => rejected_codes.push(status.code()),
+        }
+    }
+
+    assert_eq!(permitted, 3);
+    assert_eq!(rejected_codes.len(), total - 3);
+    assert!(rejected_codes.iter().all(|&c| c == Code::ResourceExhausted));
+
+    drop(client);
     let _ = shutdown_tx.send(());
     server_task.await.unwrap();
 }
