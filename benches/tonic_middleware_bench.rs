@@ -69,11 +69,15 @@ fn bench_key_extractors(c: &mut Criterion) {
     // Benchmark IpKeyExtractor
     group.bench_function("ip_key_extractor", |b| {
         let extractor = IpKeyExtractor;
-        let req = http::Request::builder()
+        let mut req = http::Request::builder()
             .uri("http://example.com/test")
-            .header("x-forwarded-for", "192.168.1.1, 10.0.0.1")
             .body(BoxBody::default())
             .unwrap();
+        req.extensions_mut()
+            .insert(tonic::transport::server::TcpConnectInfo {
+                local_addr: None,
+                remote_addr: Some("10.0.0.1:50000".parse().unwrap()),
+            });
 
         b.iter(|| {
             let key = extractor.extract(black_box(&req));
@@ -229,14 +233,18 @@ fn bench_different_key_extractors_performance(c: &mut Criterion) {
     // IP-based extraction
     group.bench_function("ip_based", |b| {
         let layer = GrpcRateLimitLayer::with_extractor(limiter.clone(), IpKeyExtractor);
+        let connect_info = tonic::transport::server::TcpConnectInfo {
+            local_addr: None,
+            remote_addr: Some("192.168.1.1:50000".parse().unwrap()),
+        };
 
         b.to_async(&rt).iter(|| async {
             let mut service = layer.layer(BenchService);
-            let req = http::Request::builder()
+            let mut req = http::Request::builder()
                 .uri("http://example.com/test.Service/Method")
-                .header("x-forwarded-for", "192.168.1.1")
                 .body(BoxBody::default())
                 .unwrap();
+            req.extensions_mut().insert(connect_info.clone());
 
             let response = service.ready().await.unwrap().call(req).await.unwrap();
             black_box(response);
