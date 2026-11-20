@@ -32,7 +32,7 @@
 use crate::algorithm::internal::http_seconds_ceil;
 pub use crate::algorithm::internal::StackIp;
 use crate::algorithm::{Algorithm, RateLimitKey, ToKey, TokenBucket};
-use crate::{IntoRateLimiter, RateLimitDecision, RateLimiter};
+use crate::{IntoRateLimiter, Ipv6Prefix, RateLimitDecision, RateLimiter};
 use http::{header::HeaderName, HeaderValue};
 use pin_project_lite::pin_project;
 use std::borrow::{Borrow, Cow};
@@ -268,14 +268,20 @@ fn parse_ip_token(token: &str) -> Option<IpAddr> {
 ///
 /// # IPv6 considerations
 ///
-/// Keys use the full IP address, so clients assigned an IPv6 `/64` (or larger) subnet can
-/// rotate interface identifiers across separate buckets. For IPv6-exposed services, combine
-/// with network-level controls or use a [`CustomGrpcKeyExtractor`] that masks IPv6 addresses
-/// to a prefix (such as `/64` or `/56`).
+/// Keys use the full IP address by default. Opt in to prefix masking with
+/// [`Self::with_ipv6_prefix`] so users sharing a prefix share a bucket. Use `/64` for a
+/// typical end-site subnet or `/56` or `/48` to group a whole customer allocation.
+/// With masking enabled, IPv4-mapped IPv6 addresses become IPv4 keys.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IpKeyExtractor;
 
 impl IpKeyExtractor {
+    /// Returns a peer IP extractor that groups IPv6 addresses by the given prefix.
+    #[must_use]
+    pub const fn with_ipv6_prefix(self, ipv6_prefix: Ipv6Prefix) -> PrefixIpKeyExtractor {
+        PrefixIpKeyExtractor::new(ipv6_prefix)
+    }
+
     /// Extracts the connection's peer IP address from a bare [`SocketAddr`] extension or
     /// [`TcpConnectInfo`] with zero heap allocation.
     #[inline]
@@ -299,6 +305,71 @@ impl GrpcKeyExtractor<IpAddr> for IpKeyExtractor {
     #[inline]
     fn extract<'a>(&'a self, req: &'a http::Request<Body>) -> Option<IpAddr> {
         peer_ip(req)
+    }
+}
+
+/// Peer IP key extractor with opt-in IPv6 prefix masking for gRPC.
+///
+/// Reads a bare [`SocketAddr`] extension or falls back to [`TcpConnectInfo`], then applies
+/// [`Ipv6Prefix::mask`]. Like [`IpKeyExtractor`], it only uses connection information.
+/// A limiter can use the resulting address directly as an [`IpAddr`] key or stack-format
+/// it as a `String` key with zero heap allocation during extraction.
+///
+/// ```
+/// use std::net::IpAddr;
+/// use tokio_rate_limit::{Ipv6Prefix, RateLimiter};
+/// use tokio_rate_limit::tonic_middleware::{GrpcRateLimitLayer, PrefixIpKeyExtractor};
+///
+/// let extractor = PrefixIpKeyExtractor::new(Ipv6Prefix::SLASH_64);
+/// let config = RateLimiter::builder().per_minute(60).burst(10);
+/// let string_layer = GrpcRateLimitLayer::with_extractor(config.build().unwrap(), extractor);
+/// let ip_layer =
+///     GrpcRateLimitLayer::with_extractor(config.build_with_key::<IpAddr>().unwrap(), extractor);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixIpKeyExtractor {
+    ipv6_prefix: Ipv6Prefix,
+}
+
+impl PrefixIpKeyExtractor {
+    /// Creates an extractor that masks IPv6 peer addresses to the given prefix.
+    pub const fn new(ipv6_prefix: Ipv6Prefix) -> Self {
+        Self { ipv6_prefix }
+    }
+
+    /// Returns the configured IPv6 prefix.
+    pub const fn ipv6_prefix(&self) -> Ipv6Prefix {
+        self.ipv6_prefix
+    }
+
+    /// Extracts and masks the connection's peer IP address with zero heap allocation.
+    #[inline]
+    pub fn extract<'a>(&'a self, req: &'a http::Request<Body>) -> Option<GrpcExtractedKey<'a>> {
+        self.extract_ip(req)
+            .map(|ip| GrpcExtractedKey::Ip(StackIp::from_ip(ip)))
+    }
+
+    #[inline]
+    fn extract_ip(&self, req: &http::Request<Body>) -> Option<IpAddr> {
+        peer_ip(req).map(|ip| self.ipv6_prefix.mask(ip))
+    }
+}
+
+impl GrpcKeyExtractor<String> for PrefixIpKeyExtractor {
+    type Key<'a> = GrpcExtractedKey<'a>;
+
+    #[inline]
+    fn extract<'a>(&'a self, req: &'a http::Request<Body>) -> Option<GrpcExtractedKey<'a>> {
+        Self::extract(self, req)
+    }
+}
+
+impl GrpcKeyExtractor<IpAddr> for PrefixIpKeyExtractor {
+    type Key<'a> = IpAddr;
+
+    #[inline]
+    fn extract<'a>(&'a self, req: &'a http::Request<Body>) -> Option<IpAddr> {
+        self.extract_ip(req)
     }
 }
 
@@ -329,8 +400,8 @@ enum ForwardedHeaderSource {
 ///   address (bare [`SocketAddr`] extension first, then [`TcpConnectInfo::remote_addr`]).
 ///
 /// Both `GrpcKeyExtractor<String>` (stack-formatted via [`StackIp::from_ip`], zero heap
-/// allocation) and `GrpcKeyExtractor<IpAddr>` key on the same parsed [`IpAddr`] and always
-/// agree.
+/// allocation) and `GrpcKeyExtractor<IpAddr>` use the same client address after extraction
+/// and any configured masking.
 ///
 /// # Proxy contract
 ///
@@ -352,13 +423,14 @@ enum ForwardedHeaderSource {
 ///
 /// # IPv6 considerations
 ///
-/// Keys use the full IP address, so clients assigned an IPv6 `/64` (or larger) subnet can
-/// rotate interface identifiers across separate buckets. For IPv6-exposed services, combine
-/// with network-level controls or use a [`CustomGrpcKeyExtractor`] that masks IPv6 addresses
-/// to a prefix (such as `/64` or `/56`).
+/// Keys use the full IP address by default. Opt in to prefix masking with
+/// [`Self::with_ipv6_prefix`] so users sharing a prefix share a bucket. Use `/64` for a
+/// typical end-site subnet or `/56` or `/48` to group a whole customer allocation.
+/// With masking enabled, IPv4-mapped IPv6 addresses become IPv4 keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForwardedIpKeyExtractor {
     source: ForwardedHeaderSource,
+    ipv6_prefix: Option<Ipv6Prefix>,
 }
 
 impl ForwardedIpKeyExtractor {
@@ -373,6 +445,7 @@ impl ForwardedIpKeyExtractor {
     pub const fn x_forwarded_for() -> Self {
         Self {
             source: ForwardedHeaderSource::XForwardedFor,
+            ipv6_prefix: None,
         }
     }
 
@@ -380,7 +453,20 @@ impl ForwardedIpKeyExtractor {
     pub const fn x_real_ip() -> Self {
         Self {
             source: ForwardedHeaderSource::XRealIp,
+            ipv6_prefix: None,
         }
+    }
+
+    /// Applies [`Ipv6Prefix::mask`] to the address from the configured header or peer fallback.
+    #[must_use]
+    pub const fn with_ipv6_prefix(mut self, ipv6_prefix: Ipv6Prefix) -> Self {
+        self.ipv6_prefix = Some(ipv6_prefix);
+        self
+    }
+
+    /// Returns the configured IPv6 prefix, or `None` when masking is disabled.
+    pub const fn ipv6_prefix(&self) -> Option<Ipv6Prefix> {
+        self.ipv6_prefix
     }
 
     #[inline]
@@ -393,14 +479,19 @@ impl ForwardedIpKeyExtractor {
 
     #[inline]
     fn extract_ip(&self, req: &http::Request<Body>) -> Option<IpAddr> {
-        match req.headers().get_all(self.header_name()).iter().next_back() {
+        let ip = match req.headers().get_all(self.header_name()).iter().next_back() {
             Some(last_field) => parse_forwarded_ip(last_field.as_bytes()),
             None => peer_ip(req),
-        }
+        }?;
+        Some(match self.ipv6_prefix {
+            Some(prefix) => prefix.mask(ip),
+            None => ip,
+        })
     }
 
     /// Extracts the client IP address from the configured forwarding header, falling back
-    /// to the connection's peer address when that header is absent.
+    /// to the connection's peer address when that header is absent. Applies the IPv6 prefix
+    /// mask when configured.
     ///
     /// Returns `None` when the configured header is present but its last comma-separated
     /// element cannot be parsed as an IP address.
@@ -1117,11 +1208,11 @@ mod tests {
         assert_eq!(key, None);
     }
 
-    fn assert_ip_extract_eq(
-        extractor: &IpKeyExtractor,
-        req: &http::Request<Body>,
-        expected: Option<IpAddr>,
-    ) {
+    fn assert_ip_extract_eq<E>(extractor: &E, req: &http::Request<Body>, expected: Option<IpAddr>)
+    where
+        E: for<'a> GrpcKeyExtractor<String, Key<'a> = GrpcExtractedKey<'a>>
+            + for<'a> GrpcKeyExtractor<IpAddr, Key<'a> = IpAddr>,
+    {
         let ip_key = GrpcKeyExtractor::<IpAddr>::extract(extractor, req);
         let str_key = GrpcKeyExtractor::<String>::extract(extractor, req);
         assert_eq!(ip_key, expected);
@@ -1136,13 +1227,89 @@ mod tests {
         req: &http::Request<Body>,
         expected: Option<IpAddr>,
     ) {
-        let ip_key = GrpcKeyExtractor::<IpAddr>::extract(extractor, req);
-        let str_key = GrpcKeyExtractor::<String>::extract(extractor, req);
-        assert_eq!(ip_key, expected);
-        assert_eq!(
-            str_key.as_deref(),
-            expected.map(|ip| ip.to_string()).as_deref()
-        );
+        assert_ip_extract_eq(extractor, req, expected);
+    }
+
+    #[test]
+    fn prefix_ip_key_extractor_groups_peers_from_both_extensions() {
+        let slash_64 = IpKeyExtractor.with_ipv6_prefix(Ipv6Prefix::SLASH_64);
+        let slash_56 = PrefixIpKeyExtractor::new(Ipv6Prefix::SLASH_56);
+        for (extractor, peer, expected) in [
+            (slash_64, "[2001:db8:1:203::1]:5000", "2001:db8:1:203::"),
+            (slash_64, "[2001:db8:1:203::2]:5001", "2001:db8:1:203::"),
+            (slash_64, "[2001:db8:1:204::1]:5000", "2001:db8:1:204::"),
+            (slash_56, "[2001:db8:1:203::1]:5000", "2001:db8:1:200::"),
+            (slash_56, "[2001:db8:1:204::1]:5000", "2001:db8:1:200::"),
+            (slash_64, "192.0.2.7:5000", "192.0.2.7"),
+            (slash_64, "[::ffff:192.0.2.7]:5000", "192.0.2.7"),
+        ] {
+            let peer: SocketAddr = peer.parse().unwrap();
+            let expected = Some(expected.parse().unwrap());
+            let mut req = http::Request::builder()
+                .header("x-forwarded-for", "203.0.113.1")
+                .header("x-real-ip", "203.0.113.2")
+                .body(Body::default())
+                .unwrap();
+            assert_ip_extract_eq(&extractor, &req, None);
+
+            req.extensions_mut().insert(TcpConnectInfo {
+                local_addr: None,
+                remote_addr: Some(peer),
+            });
+            assert_ip_extract_eq(&extractor, &req, expected);
+
+            req.extensions_mut().insert(TcpConnectInfo {
+                local_addr: None,
+                remote_addr: Some("203.0.113.3:5000".parse().unwrap()),
+            });
+            req.extensions_mut().insert(peer);
+            assert_ip_extract_eq(&extractor, &req, expected);
+        }
+    }
+
+    #[test]
+    fn forwarded_ip_key_extractor_masks_header_or_peer_fallback() {
+        for (extractor, header, value) in [
+            (
+                ForwardedIpKeyExtractor::x_forwarded_for(),
+                "x-forwarded-for",
+                "192.0.2.7, 2001:db8:1:2::1234",
+            ),
+            (
+                ForwardedIpKeyExtractor::x_real_ip(),
+                "x-real-ip",
+                "[2001:db8:1:2::1234]:5000",
+            ),
+        ] {
+            assert_eq!(extractor.ipv6_prefix(), None);
+            let masked = extractor.with_ipv6_prefix(Ipv6Prefix::SLASH_64);
+            assert_eq!(masked.ipv6_prefix(), Some(Ipv6Prefix::SLASH_64));
+
+            let peer: SocketAddr = "[2001:db8:1:3::5678]:5001".parse().unwrap();
+            let mut req = http::Request::builder()
+                .extension(peer)
+                .header(header, value)
+                .body(Body::default())
+                .unwrap();
+            assert_forwarded_extract_eq(
+                &extractor,
+                &req,
+                Some("2001:db8:1:2::1234".parse().unwrap()),
+            );
+            assert_forwarded_extract_eq(&masked, &req, Some("2001:db8:1:2::".parse().unwrap()));
+
+            req.headers_mut()
+                .insert(header, HeaderValue::from_static("[::ffff:192.0.2.7]:5000"));
+            assert_forwarded_extract_eq(&masked, &req, Some("192.0.2.7".parse().unwrap()));
+
+            req.headers_mut()
+                .insert(header, HeaderValue::from_static("invalid"));
+            assert_forwarded_extract_eq(&masked, &req, None);
+
+            req.headers_mut().remove(header);
+            assert_forwarded_extract_eq(&extractor, &req, Some(peer.ip()));
+            assert_forwarded_extract_eq(&masked, &req, Some("2001:db8:1:3::".parse().unwrap()));
+        }
     }
 
     #[test]

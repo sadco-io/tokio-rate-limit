@@ -20,7 +20,7 @@ use tokio_rate_limit::tonic_middleware::{
     CustomGrpcKeyExtractor, ForwardedIpKeyExtractor, GrpcKeyExtractor, GrpcLookupKey,
     GrpcRateLimitLayer, IpKeyExtractor, MetadataKeyExtractor,
 };
-use tokio_rate_limit::RateLimiter;
+use tokio_rate_limit::{Ipv6Prefix, RateLimiter};
 use tonic::body::Body;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::metadata::MetadataValue;
@@ -248,6 +248,44 @@ async fn test_ip_based_rate_limiting() {
         .body(Body::default())
         .unwrap();
     assert_grpc_rate_limited(&service.ready().await.unwrap().call(request).await.unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn ipv6_peers_in_same_prefix_share_grpc_bucket() {
+    let config = RateLimiter::builder().per_minute(1).burst(1);
+    let extractor = IpKeyExtractor.with_ipv6_prefix(Ipv6Prefix::SLASH_64);
+    let string_service =
+        GrpcRateLimitLayer::with_extractor(config.build().unwrap(), extractor).layer(TestService);
+    let ip_service =
+        GrpcRateLimitLayer::with_extractor(config.build_with_key::<IpAddr>().unwrap(), extractor)
+            .layer(TestService);
+
+    async fn assert_shared_bucket<S>(mut service: S)
+    where
+        S: Service<http::Request<Body>, Response = http::Response<Body>>,
+        S::Error: std::fmt::Debug,
+    {
+        for (peer, limited) in [
+            ("[2001:db8:1:2::1]:5000", false),
+            ("[2001:db8:1:2::2]:5001", true),
+            ("[2001:db8:1:3::1]:5000", false),
+        ] {
+            let request = http::Request::builder()
+                .uri("http://localhost/test.Service/Method")
+                .extension(peer.parse::<SocketAddr>().unwrap())
+                .body(Body::default())
+                .unwrap();
+            let response = service.ready().await.unwrap().call(request).await.unwrap();
+            if limited {
+                assert_grpc_rate_limited(&response);
+            } else {
+                assert_grpc_ok(&response);
+            }
+        }
+    }
+
+    assert_shared_bucket(string_service).await;
+    assert_shared_bucket(ip_service).await;
 }
 
 #[tokio::test]

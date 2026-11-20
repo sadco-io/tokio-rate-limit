@@ -49,6 +49,7 @@
 
 pub mod algorithm;
 mod error;
+mod ip_prefix;
 mod limiter;
 
 #[cfg(feature = "middleware")]
@@ -60,6 +61,7 @@ pub mod middleware;
 pub mod tonic_middleware;
 
 pub use error::{Error, Result};
+pub use ip_prefix::{InvalidIpv6Prefix, Ipv6Prefix};
 pub use limiter::{
     IntoRateLimiter, RateLimitDecision, RateLimiter, RateLimiterBuilder, RateLimiterConfig,
 };

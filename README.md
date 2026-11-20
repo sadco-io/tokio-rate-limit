@@ -349,6 +349,17 @@ async fn handler() -> &'static str {
 }
 ```
 
+**IPv6 prefix masking** is opt-in. Addresses in the same prefix share a bucket. Use `/64`
+for a typical subnet or `/56` or `/48` to group a customer allocation. IPv4-mapped IPv6
+addresses become IPv4 keys when masking is enabled.
+
+```rust
+use tokio_rate_limit::Ipv6Prefix;
+use tokio_rate_limit::middleware::{IpKeyExtractor, RateLimitLayer};
+
+let layer = RateLimitLayer::with_extractor(limiter, IpKeyExtractor.with_ipv6_prefix(Ipv6Prefix::SLASH_64));
+```
+
 **Response Headers (IETF RFC Standards):**
 
 When rate limit is applied, responses include:
@@ -469,7 +480,7 @@ GrpcRateLimitLayer::with_extractor(
 
 > **Notes on gRPC IP extraction:**
 > - **Proxy contract:** Use `ForwardedIpKeyExtractor` only when the gRPC server is not directly reachable by clients and every request passes through a trusted proxy directly in front of it (`x_forwarded_for()` requires overwriting `x-forwarded-for` or appending the client IP as the final element of the final field; `x_real_ip()` requires overwriting `x-real-ip` on every request; in multi-proxy chains, configure the nearest proxy so the final element is the real client). The value the proxy writes must be a bare IP address, or `v4:port` / `[v6]:port` when a port is included (an unbracketed IPv6 address with a port is ambiguous); IPv6 zone IDs are not supported. Absent headers fall back to the peer address; present but malformed headers return `None` (fail-closed unless `.fail_open()` is set).
-> - **IPv6 addresses:** Both `IpKeyExtractor` and `ForwardedIpKeyExtractor` key on the full IP address, so clients assigned an IPv6 `/64` (or larger) subnet can rotate addresses across buckets. Use network-level controls or a `CustomGrpcKeyExtractor` that masks IPv6 prefixes (e.g. `/64` or `/56`).
+> - **IPv6 addresses** use the full address by default. With `Ipv6Prefix` from the crate root, call `.with_ipv6_prefix(Ipv6Prefix::SLASH_64)` on `IpKeyExtractor` or `ForwardedIpKeyExtractor` to share a bucket across a typical `/64` subnet. Use `/56` or `/48` to group a customer allocation. With masking enabled, IPv4-mapped IPv6 addresses become IPv4 keys.
 > - **`fail_open()` and non-TCP transports:** Transports without `TcpConnectInfo` (such as Unix domain sockets or custom `serve_with_incoming` TLS streams that do not attach `TcpConnectInfo` or a bare `SocketAddr` extension) have no peer address, so `IpKeyExtractor` combined with `.fail_open()` applies no limit.
 
 **Features:**
