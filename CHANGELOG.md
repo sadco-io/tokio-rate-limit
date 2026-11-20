@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-11-19
+
+### Dependencies
+
+Updated locked dependency versions from Dependabot PR #18 (`Cargo.lock` only; the crate's `Cargo.toml` dependency requirements are unchanged):
+
+- `tonic`, `tonic-build`, `tonic-prost`, `tonic-prost-build`: `0.14.6` → `0.14.9`
+- `hyper`: `1.11.0` → `1.12.0`
+- `redis`: `1.6.0` → `1.8.2`
+- `prost`, `prost-derive`: `0.14.4` → `0.14.6`
+- `serde_json`: `1.0.151` → `1.0.154`
+- `thiserror`, `thiserror-impl`: `2.0.20` → `2.0.21`
+- `scc`: `3.8.6` → `3.9.0`
+- `sdd`: `4.8.10` → `4.10.3`
+- `want`: `0.3.1` → `0.3.2`
+
 ## [0.11.1] - 2026-11-19
 
 ### Security
