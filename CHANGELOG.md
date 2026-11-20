@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-11-20
+
 ### Added
 
 - Crate-root `Ipv6Prefix` and `InvalidIpv6Prefix` for validating and applying IPv6 prefix lengths (#23).
