@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Crate-root `Ipv6Prefix` and `InvalidIpv6Prefix` for validating and applying IPv6 prefix lengths (#23).
+- HTTP and gRPC `PrefixIpKeyExtractor` types and `IpKeyExtractor::with_ipv6_prefix` for opt-in peer address masking (#23).
+- `ForwardedIpKeyExtractor::with_ipv6_prefix` for masking forwarded gRPC client addresses or peer fallback addresses (#23).
+
 ## [0.11.2] - 2026-11-19
 
 ### Dependencies

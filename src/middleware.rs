@@ -26,7 +26,7 @@
 use crate::algorithm::internal::http_seconds_ceil;
 pub use crate::algorithm::internal::StackIp;
 use crate::algorithm::{Algorithm, RateLimitKey, ToKey, TokenBucket};
-use crate::{IntoRateLimiter, RateLimitDecision, RateLimiter};
+use crate::{IntoRateLimiter, Ipv6Prefix, RateLimitDecision, RateLimiter};
 use axum::{
     body::Body,
     extract::ConnectInfo,
@@ -199,20 +199,38 @@ pub trait KeyExtractor<B = Body, K: RateLimitKey = String>: Send + Sync + 'stati
     fn extract<'a>(&'a self, req: &'a Request<B>) -> Option<Self::Key<'a>>;
 }
 
+#[inline]
+fn peer_ip<B>(req: &Request<B>) -> Option<IpAddr> {
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip())
+}
+
 /// Default key extractor using the peer client's IP address from `ConnectInfo<SocketAddr>`.
 ///
 /// Supports both `RateLimiter<TokenBucket<String>>` (stack-formatted IP with zero heap
 /// allocation) and `RateLimiter<TokenBucket<IpAddr>>` (raw `IpAddr` with zero formatting).
+///
+/// # IPv6 considerations
+///
+/// Keys use the full IP address by default. Opt in to prefix masking with
+/// [`Self::with_ipv6_prefix`] so users sharing a prefix share a bucket. Use `/64` for a
+/// typical end-site subnet or `/56` or `/48` to group a whole customer allocation.
+/// With masking enabled, IPv4-mapped IPv6 addresses become IPv4 keys.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IpKeyExtractor;
 
 impl IpKeyExtractor {
+    /// Returns a peer IP extractor that groups IPv6 addresses by the given prefix.
+    #[must_use]
+    pub const fn with_ipv6_prefix(self, ipv6_prefix: Ipv6Prefix) -> PrefixIpKeyExtractor {
+        PrefixIpKeyExtractor::new(ipv6_prefix)
+    }
+
     /// Extracts the peer IP address from `ConnectInfo<SocketAddr>` onto a stack buffer.
     #[inline]
     pub fn extract<B>(&self, req: &Request<B>) -> Option<StackIp> {
-        req.extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|ConnectInfo(addr)| StackIp::from_ip(addr.ip()))
+        peer_ip(req).map(StackIp::from_ip)
     }
 }
 
@@ -236,9 +254,76 @@ impl<B> KeyExtractor<B, IpAddr> for IpKeyExtractor {
 
     #[inline]
     fn extract<'a>(&'a self, req: &'a Request<B>) -> Option<IpAddr> {
-        req.extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|ConnectInfo(addr)| addr.ip())
+        peer_ip(req)
+    }
+}
+
+/// Peer IP key extractor with opt-in IPv6 prefix masking.
+///
+/// Reads `ConnectInfo<SocketAddr>` and applies [`Ipv6Prefix::mask`]. A limiter can use
+/// the resulting address directly as an [`IpAddr`] key or stack-format it as a `String`
+/// key with zero heap allocation during extraction.
+///
+/// ```
+/// use std::net::IpAddr;
+/// use tokio_rate_limit::{Ipv6Prefix, RateLimiter};
+/// use tokio_rate_limit::middleware::{PrefixIpKeyExtractor, RateLimitLayer};
+///
+/// let extractor = PrefixIpKeyExtractor::new(Ipv6Prefix::SLASH_64);
+/// let config = RateLimiter::builder().per_minute(60).burst(10);
+/// let string_layer = RateLimitLayer::with_extractor(config.build().unwrap(), extractor);
+/// let ip_layer =
+///     RateLimitLayer::with_extractor(config.build_with_key::<IpAddr>().unwrap(), extractor);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixIpKeyExtractor {
+    ipv6_prefix: Ipv6Prefix,
+}
+
+impl PrefixIpKeyExtractor {
+    /// Creates an extractor that masks IPv6 peer addresses to the given prefix.
+    pub const fn new(ipv6_prefix: Ipv6Prefix) -> Self {
+        Self { ipv6_prefix }
+    }
+
+    /// Returns the configured IPv6 prefix.
+    pub const fn ipv6_prefix(&self) -> Ipv6Prefix {
+        self.ipv6_prefix
+    }
+
+    /// Extracts and masks the peer IP address from `ConnectInfo<SocketAddr>` onto a stack buffer.
+    #[inline]
+    pub fn extract<B>(&self, req: &Request<B>) -> Option<StackIp> {
+        self.extract_ip(req).map(StackIp::from_ip)
+    }
+
+    #[inline]
+    fn extract_ip<B>(&self, req: &Request<B>) -> Option<IpAddr> {
+        peer_ip(req).map(|ip| self.ipv6_prefix.mask(ip))
+    }
+}
+
+impl<B> KeyExtractor<B, String> for PrefixIpKeyExtractor {
+    type Key<'a>
+        = StackIp
+    where
+        B: 'a;
+
+    #[inline]
+    fn extract<'a>(&'a self, req: &'a Request<B>) -> Option<StackIp> {
+        Self::extract(self, req)
+    }
+}
+
+impl<B> KeyExtractor<B, IpAddr> for PrefixIpKeyExtractor {
+    type Key<'a>
+        = IpAddr
+    where
+        B: 'a;
+
+    #[inline]
+    fn extract<'a>(&'a self, req: &'a Request<B>) -> Option<IpAddr> {
+        self.extract_ip(req)
     }
 }
 
@@ -921,6 +1006,74 @@ mod tests {
     use std::sync::Arc;
     use tower::limit::ConcurrencyLimitLayer;
     use tower::ServiceExt;
+
+    #[test]
+    fn prefix_ip_key_extractor_groups_peer_addresses() {
+        let slash_64 = IpKeyExtractor.with_ipv6_prefix(Ipv6Prefix::SLASH_64);
+        let slash_56 = PrefixIpKeyExtractor::new(Ipv6Prefix::SLASH_56);
+        for (extractor, peer, expected) in [
+            (slash_64, "[2001:db8:1:203::1]:5000", "2001:db8:1:203::"),
+            (slash_64, "[2001:db8:1:203::2]:5001", "2001:db8:1:203::"),
+            (slash_64, "[2001:db8:1:204::1]:5000", "2001:db8:1:204::"),
+            (slash_56, "[2001:db8:1:203::1]:5000", "2001:db8:1:200::"),
+            (slash_56, "[2001:db8:1:204::1]:5000", "2001:db8:1:200::"),
+            (slash_64, "192.0.2.7:5000", "192.0.2.7"),
+            (slash_64, "[::ffff:192.0.2.7]:5000", "192.0.2.7"),
+        ] {
+            let req = Request::builder()
+                .extension(ConnectInfo(peer.parse::<SocketAddr>().unwrap()))
+                .body(Body::empty())
+                .unwrap();
+            let key = KeyExtractor::<Body, String>::extract(&extractor, &req).unwrap();
+            assert_eq!(key.as_str(), expected);
+            assert_eq!(
+                KeyExtractor::<Body, IpAddr>::extract(&extractor, &req),
+                Some(expected.parse().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_ip_key_extractor_requires_connect_info() {
+        let extractor = IpKeyExtractor.with_ipv6_prefix(Ipv6Prefix::SLASH_64);
+        let req = Request::new(Body::empty());
+        assert!(extractor.extract(&req).is_none());
+        assert_eq!(
+            KeyExtractor::<Body, IpAddr>::extract(&extractor, &req),
+            None
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ipv6_peers_in_same_prefix_share_http_bucket() {
+        let config = RateLimiter::builder().per_minute(1).burst(1);
+        let extractor = IpKeyExtractor.with_ipv6_prefix(Ipv6Prefix::SLASH_64);
+        let router = Router::new().route("/", get(|| async { "Hello" }));
+        let string_app = router.clone().layer(RateLimitLayer::with_extractor(
+            config.build().unwrap(),
+            extractor,
+        ));
+        let ip_app = router.layer(RateLimitLayer::with_extractor(
+            config.build_with_key::<IpAddr>().unwrap(),
+            extractor,
+        ));
+
+        for app in [string_app, ip_app] {
+            for (peer, expected) in [
+                ("[2001:db8:1:2::1]:5000", StatusCode::OK),
+                ("[2001:db8:1:2::2]:5001", StatusCode::TOO_MANY_REQUESTS),
+                ("[2001:db8:1:3::1]:5000", StatusCode::OK),
+            ] {
+                let req = Request::builder()
+                    .uri("/")
+                    .extension(ConnectInfo(peer.parse::<SocketAddr>().unwrap()))
+                    .body(Body::empty())
+                    .unwrap();
+                let response = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(response.status(), expected);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_rate_limit_allows_within_limit() {
